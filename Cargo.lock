@@ -4111,6 +4111,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "connector-milvus"
+version = "2.0.1"
+dependencies = [
+ "async-trait",
+ "datafusion",
+ "futures",
+ "reqwest 0.12.24",
+ "runtime",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "snafu",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "connector-mongodb"
 version = "2.0.1"
 dependencies = [
@@ -18131,6 +18148,7 @@ dependencies = [
  "connector-ftp",
  "connector-graphql",
  "connector-imap",
+ "connector-milvus",
  "connector-mongodb",
  "connector-mssql",
  "connector-mysql",

@@ -130,6 +130,9 @@ pub async fn register_external_connectors() {
     #[cfg(feature = "ftp")]
     register_connector_factory(connector_ftp::CONNECTOR_NAME, connector_ftp::factory()).await;
 
+    #[cfg(feature = "milvus")]
+    register_connector_factory(connector_milvus::CONNECTOR_NAME, connector_milvus::factory()).await;
+
     #[cfg(feature = "imap")]
     register_connector_factory(connector_imap::CONNECTOR_NAME, connector_imap::factory()).await;
 

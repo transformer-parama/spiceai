@@ -1,0 +1,23 @@
+[package]
+name = "connector-milvus"
+edition.workspace = true
+version.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+description = "Milvus vector-search data connector for Spice.ai runtime"
+
+[dependencies]
+async-trait.workspace = true
+datafusion.workspace = true
+futures.workspace = true
+reqwest.workspace = true
+runtime = { path = "../../runtime" }
+secrecy.workspace = true
+serde = { workspace = true }
+serde_json.workspace = true
+snafu.workspace = true
+tokio = { workspace = true, features = ["time"] }
+tracing.workspace = true
+
+[features]
+default = []
