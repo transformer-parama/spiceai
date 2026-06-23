@@ -1,0 +1,30 @@
+# CI for the custom Milvus data connector.
+# Runs the connector's unit tests on changes to the crate. Cargo caching keeps
+# subsequent runs fast (the first run compiles the dependency closure once).
+#
+# NOTE: this exercises the unit tests only (no network). The live-Milvus
+# end-to-end integration test lives in the app repo (scripts/integration_test.py)
+# and runs against a deployed stack.
+name: connector-milvus
+
+on:
+  push:
+    paths:
+      - "crates/data-connectors/connector-milvus/**"
+      - ".github/workflows/connector-milvus.yml"
+  pull_request:
+    paths:
+      - "crates/data-connectors/connector-milvus/**"
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Unit tests
+        run: cargo test -p connector-milvus
