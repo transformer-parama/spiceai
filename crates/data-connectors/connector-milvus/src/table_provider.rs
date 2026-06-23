@@ -60,8 +60,10 @@ impl MilvusTableProvider {
     }
 }
 
-/// Pull the query embedding out of a `query_vector = '[...]'` predicate.
-fn extract_query_vector(filters: &[Expr]) -> Option<Vec<f32>> {
+/// The raw `query_vector = '[...]'` literal (the JSON-encoded embedding), if the
+/// predicate is present. Parsing/validation happens in `scan` so a malformed
+/// vector yields a clear error distinct from "no embedding given".
+fn query_vector_literal(filters: &[Expr]) -> Option<&str> {
     for f in filters {
         if let Expr::BinaryExpr(b) = f {
             if b.op == Operator::Eq {
@@ -69,13 +71,18 @@ fn extract_query_vector(filters: &[Expr]) -> Option<Vec<f32>> {
                     (b.left.as_ref(), b.right.as_ref())
                 {
                     if c.name == "query_vector" {
-                        return serde_json::from_str::<Vec<f32>>(s).ok();
+                        return Some(s.as_str());
                     }
                 }
             }
         }
     }
     None
+}
+
+#[cfg(test)]
+fn extract_query_vector(filters: &[Expr]) -> Option<Vec<f32>> {
+    query_vector_literal(filters).and_then(|s| serde_json::from_str(s).ok())
 }
 
 /// Escape a string value for a Milvus boolean-expression double-quoted literal.
@@ -173,11 +180,18 @@ impl TableProvider for MilvusTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let query_vector = extract_query_vector(filters).ok_or_else(|| {
+        let qv_literal = query_vector_literal(filters).ok_or_else(|| {
             DataFusionError::Plan(
-                "milvus: a query embedding is required, e.g. WHERE query_vector = '[...]'"
+                "milvus: a query embedding is required, e.g. \
+                 WHERE query_vector = '[0.1, 0.2, ...]'"
                     .to_string(),
             )
+        })?;
+        let query_vector: Vec<f32> = serde_json::from_str(qv_literal).map_err(|e| {
+            DataFusionError::Plan(format!(
+                "milvus: query_vector must be a JSON array of floats matching the \
+                 collection's vector dimension (e.g. '[0.1, 0.2]'): {e}"
+            ))
         })?;
         let filter = extract_milvus_filter(filters);
         let top_k = limit.unwrap_or(DEFAULT_TOP_K);

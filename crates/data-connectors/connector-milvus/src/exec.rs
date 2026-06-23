@@ -70,7 +70,7 @@ pub struct MilvusExec {
 impl MilvusExec {
     pub fn new(
         conn: Arc<MilvusConnection>,
-        coll: MilvusCollection,
+        mut coll: MilvusCollection,
         full_schema: SchemaRef,
         query_vector: Vec<f32>,
         filter: Option<String>,
@@ -81,6 +81,14 @@ impl MilvusExec {
             Some(idx) => Arc::new(full_schema.project(idx).map_err(DataFusionError::from)?),
             None => full_schema.clone(),
         };
+        // projection pushdown: ask Milvus only for the scalar fields this scan
+        // actually returns (query_vector is input-only; score is synthetic).
+        coll.output_fields = projected_schema
+            .fields()
+            .iter()
+            .map(|f| f.name().to_string())
+            .filter(|n| n != "query_vector" && n != "score")
+            .collect();
         let props = PlanProperties::new(
             EquivalenceProperties::new(projected_schema.clone()),
             Partitioning::UnknownPartitioning(1),

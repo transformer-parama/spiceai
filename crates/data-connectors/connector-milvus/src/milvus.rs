@@ -20,15 +20,37 @@ limitations under the License.
 //! ANN search and schema introspection are JSON POSTs -- no protobuf/tonic.
 //!
 //! [`MilvusConnection`] owns a pooled, timeout-bounded `reqwest::Client` shared
-//! across datasets/queries. Transient transport failures are retried with
-//! jittered exponential backoff; API errors are returned immediately. Auth via
-//! bearer token; TLS via the `secure` flag. The connector is collection-agnostic:
-//! [`MilvusConnection::describe_collection`] builds the table schema dynamically.
+//! across datasets/queries. Transient transport failures (timeouts, connection
+//! resets, 5xx) are retried with jittered exponential backoff; API errors are
+//! returned immediately. Auth via bearer token; TLS via the `secure` flag. The
+//! connector is collection-agnostic via [`MilvusConnection::describe_collection`].
+//! OpenTelemetry metrics are emitted under the `connector_milvus` meter.
 
+use std::sync::LazyLock;
 use std::time::Duration;
 
+use opentelemetry::metrics::{Counter, Histogram, Meter};
+use opentelemetry::{global, KeyValue};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+
+// ---- OpenTelemetry metrics (flow into Spice's global meter provider) ----
+static METER: LazyLock<Meter> = LazyLock::new(|| global::meter("connector_milvus"));
+static SEARCH_REQUESTS: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER.u64_counter("milvus.search.requests").with_description("Milvus ANN searches").build()
+});
+static SEARCH_ERRORS: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER.u64_counter("milvus.search.errors").with_description("Failed Milvus searches").build()
+});
+static SEARCH_RETRIES: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER.u64_counter("milvus.search.retries").with_description("Milvus search retries").build()
+});
+static SEARCH_DURATION: LazyLock<Histogram<f64>> = LazyLock::new(|| {
+    METER
+        .f64_histogram("milvus.search.duration_seconds")
+        .with_description("Milvus search wall-clock duration")
+        .build()
+});
 
 /// How to *reach* Milvus. Built once from `spicepod.yaml` params and shared.
 pub struct ConnectionConfig {
@@ -113,11 +135,16 @@ impl From<reqwest::Error> for MilvusError {
 }
 
 impl MilvusError {
-    /// Only transport-level failures are worth retrying; a bad collection or
-    /// malformed request will fail identically every time.
+    /// Retry transport failures and 5xx; never retry API errors (code != 0) or
+    /// 4xx -- those fail identically every time.
     fn is_retryable(&self) -> bool {
         match self {
-            MilvusError::Http(e) => e.is_timeout() || e.is_connect() || e.is_request(),
+            MilvusError::Http(e) => {
+                e.is_timeout()
+                    || e.is_connect()
+                    || e.is_request()
+                    || e.status().is_some_and(|s| s.is_server_error())
+            }
             _ => false,
         }
     }
@@ -233,9 +260,27 @@ impl MilvusConnection {
             .collect())
     }
 
-    /// Run a single ANN search, retrying transient failures with jittered
-    /// backoff. `filter` is a Milvus boolean expression or None.
+    /// Run a single ANN search (metric-aware score), retrying transient failures
+    /// with jittered backoff. Emits OpenTelemetry metrics.
     pub async fn search(
+        &self,
+        coll: &MilvusCollection,
+        vector: Vec<f32>,
+        limit: usize,
+        filter: Option<String>,
+    ) -> Result<Vec<Hit>, MilvusError> {
+        let attrs = [KeyValue::new("collection", coll.collection.clone())];
+        SEARCH_REQUESTS.add(1, &attrs);
+        let t0 = std::time::Instant::now();
+        let out = self.search_retrying(coll, vector, limit, filter).await;
+        SEARCH_DURATION.record(t0.elapsed().as_secs_f64(), &attrs);
+        if out.is_err() {
+            SEARCH_ERRORS.add(1, &attrs);
+        }
+        out
+    }
+
+    async fn search_retrying(
         &self,
         coll: &MilvusCollection,
         vector: Vec<f32>,
@@ -259,6 +304,7 @@ impl MilvusConnection {
             match self.try_search(&url, &body, flip).await {
                 Ok(hits) => return Ok(hits),
                 Err(e) if attempt < self.max_retries && e.is_retryable() => {
+                    SEARCH_RETRIES.add(1, &[KeyValue::new("collection", coll.collection.clone())]);
                     let backoff = self.retry_base * 2u32.saturating_pow(attempt);
                     let jitter = Duration::from_millis((rand::random::<f64>() * 200.0) as u64);
                     tracing::warn!(
@@ -302,5 +348,143 @@ impl MilvusConnection {
                 Hit { fields: row, score }
             })
             .collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn conn(uri: &str, token: Option<&str>, max_retries: u32) -> MilvusConnection {
+        let hostport = uri.strip_prefix("http://").unwrap();
+        let (host, port) = hostport.split_once(':').unwrap();
+        MilvusConnection::new(ConnectionConfig {
+            host: host.to_string(),
+            port: port.parse().unwrap(),
+            secure: false,
+            token: token.map(str::to_string),
+            timeout: Duration::from_secs(5),
+            connect_timeout: Duration::from_secs(2),
+            max_retries,
+        })
+        .unwrap()
+    }
+
+    fn coll(metric: &str) -> MilvusCollection {
+        MilvusCollection {
+            collection: "c".to_string(),
+            vector_field: "embedding".to_string(),
+            metric: metric.to_string(),
+            output_fields: vec!["title".to_string()],
+        }
+    }
+
+    #[tokio::test]
+    async fn cosine_score_is_passed_through() {
+        let s = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v2/vectordb/entities/search"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({"code":0, "data":[{"title":"x","distance":0.9}]}),
+            ))
+            .mount(&s)
+            .await;
+        let hits = conn(&s.uri(), None, 0).search(&coll("COSINE"), vec![0.0; 4], 1, None).await.unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!((hits[0].score - 0.9).abs() < 1e-6);
+        assert_eq!(hits[0].fields.get("title").and_then(Value::as_str), Some("x"));
+    }
+
+    #[tokio::test]
+    async fn l2_score_is_negated_higher_is_better() {
+        let s = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v2/vectordb/entities/search"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"code":0,"data":[{"distance":4.0}]})))
+            .mount(&s)
+            .await;
+        let hits = conn(&s.uri(), None, 0).search(&coll("L2"), vec![0.0; 4], 1, None).await.unwrap();
+        assert!((hits[0].score - (-4.0)).abs() < 1e-6);
+    }
+
+    #[tokio::test]
+    async fn api_error_code_is_not_retried() {
+        let s = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v2/vectordb/entities/search"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({"code":100, "message":"collection not found"}),
+            ))
+            .expect(1) // verified on drop: exactly one call, no retry
+            .mount(&s)
+            .await;
+        let err = conn(&s.uri(), None, 3).search(&coll("COSINE"), vec![0.0; 4], 1, None).await.unwrap_err();
+        assert!(matches!(err, MilvusError::Api { code: 100, .. }));
+    }
+
+    #[tokio::test]
+    async fn transient_5xx_is_retried_then_succeeds() {
+        let s = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v2/vectordb/entities/search"))
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(2)
+            .mount(&s)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v2/vectordb/entities/search"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"code":0,"data":[]})))
+            .mount(&s)
+            .await;
+        let hits = conn(&s.uri(), None, 3).search(&coll("COSINE"), vec![0.0; 4], 1, None).await.unwrap();
+        assert!(hits.is_empty());
+    }
+
+    #[tokio::test]
+    async fn bearer_token_is_sent() {
+        let s = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v2/vectordb/entities/search"))
+            .and(header("authorization", "Bearer secret-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"code":0,"data":[]})))
+            .expect(1)
+            .mount(&s)
+            .await;
+        conn(&s.uri(), Some("secret-token"), 0).search(&coll("COSINE"), vec![0.0; 4], 1, None).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn malformed_json_is_decode_error() {
+        let s = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v2/vectordb/entities/search"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("not json"))
+            .mount(&s)
+            .await;
+        let err = conn(&s.uri(), None, 0).search(&coll("COSINE"), vec![0.0; 4], 1, None).await.unwrap_err();
+        assert!(matches!(err, MilvusError::Decode(_)));
+    }
+
+    #[tokio::test]
+    async fn describe_parses_fields_and_flags_vector() {
+        let s = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v2/vectordb/collections/describe"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "code":0,
+                "data":{"fields":[
+                    {"name":"id","type":"Int64"},
+                    {"name":"title","type":"VarChar"},
+                    {"name":"embedding","type":"FloatVector"}
+                ]}
+            })))
+            .mount(&s)
+            .await;
+        let fields = conn(&s.uri(), None, 0).describe_collection("c").await.unwrap();
+        assert_eq!(fields.len(), 3);
+        assert!(fields.iter().find(|f| f.name == "embedding").unwrap().is_vector);
+        assert!(!fields.iter().find(|f| f.name == "id").unwrap().is_vector);
     }
 }
