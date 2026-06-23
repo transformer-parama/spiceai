@@ -16,15 +16,14 @@ limitations under the License.
 
 //! Async Milvus client over the RESTful v2 API.
 //!
-//! Milvus 2.4+ multiplexes HTTP and gRPC on the same port (default 19530), so an
-//! ANN search is a single JSON POST to `/v2/vectordb/entities/search` -- no
-//! protobuf/tonic vendoring.
+//! Milvus 2.4+ multiplexes HTTP and gRPC on the same port (default 19530), so
+//! ANN search and schema introspection are JSON POSTs -- no protobuf/tonic.
 //!
-//! [`MilvusConnection`] owns a **pooled, timeout-bounded** `reqwest::Client` and
-//! is shared (via `Arc`) across every dataset and query. Transient transport
-//! failures (timeouts, connection resets, 5xx) are retried with exponential
-//! backoff; API-level errors (e.g. "collection not found") are returned
-//! immediately. Auth is via a bearer token; TLS via the `secure` flag.
+//! [`MilvusConnection`] owns a pooled, timeout-bounded `reqwest::Client` shared
+//! across datasets/queries. Transient transport failures are retried with
+//! jittered exponential backoff; API errors are returned immediately. Auth via
+//! bearer token; TLS via the `secure` flag. The connector is collection-agnostic:
+//! [`MilvusConnection::describe_collection`] builds the table schema dynamically.
 
 use std::time::Duration;
 
@@ -43,13 +42,29 @@ pub struct ConnectionConfig {
     pub max_retries: u32,
 }
 
-/// What to *query* -- one Milvus collection. Resolved per dataset.
+/// What to *query* -- one Milvus collection.
 #[derive(Clone, Debug)]
 pub struct MilvusCollection {
     pub collection: String,
     pub vector_field: String,
     pub metric: String, // COSINE | L2 | IP
     pub output_fields: Vec<String>,
+}
+
+impl MilvusCollection {
+    /// Milvus L2 is a distance (lower = closer); COSINE/IP are similarities
+    /// (higher = closer). We normalize so `score` is ALWAYS higher-is-better.
+    fn is_distance_metric(&self) -> bool {
+        self.metric.eq_ignore_ascii_case("L2")
+    }
+}
+
+/// A field discovered by collection introspection.
+#[derive(Clone, Debug)]
+pub struct CollectionField {
+    pub name: String,
+    pub type_name: String, // Milvus type, e.g. "Int64", "VarChar", "FloatVector"
+    pub is_vector: bool,
 }
 
 /// A pooled connection to a Milvus deployment (cheap to clone via `Arc` inside).
@@ -108,7 +123,7 @@ impl MilvusError {
     }
 }
 
-/// One ANN hit: the output-field values plus the similarity score.
+/// One ANN hit: the output-field values plus the (normalized) similarity score.
 #[derive(Debug, Clone)]
 pub struct Hit {
     pub fields: serde_json::Map<String, Value>,
@@ -140,6 +155,28 @@ struct SearchResponse {
     data: Vec<serde_json::Map<String, Value>>,
 }
 
+#[derive(Deserialize, Default)]
+struct DescribeData {
+    #[serde(default)]
+    fields: Vec<DescribeField>,
+}
+
+#[derive(Deserialize)]
+struct DescribeField {
+    name: String,
+    #[serde(rename = "type", default)]
+    type_name: String,
+}
+
+#[derive(Deserialize)]
+struct DescribeResponse {
+    code: i64,
+    #[serde(default)]
+    message: String,
+    #[serde(default)]
+    data: DescribeData,
+}
+
 impl MilvusConnection {
     pub fn new(cfg: ConnectionConfig) -> Result<Self, MilvusError> {
         let http = reqwest::Client::builder()
@@ -157,8 +194,47 @@ impl MilvusConnection {
         })
     }
 
-    /// Run a single ANN search, retrying transient failures with backoff.
-    /// `filter` is a Milvus boolean expression or None.
+    fn authed(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match &self.token {
+            Some(t) => req.bearer_auth(t),
+            None => req,
+        }
+    }
+
+    /// Introspect a collection's fields so the connector can build its Arrow
+    /// schema dynamically (works for ANY collection layout). Doubles as a
+    /// reachability/existence check at dataset registration.
+    pub async fn describe_collection(
+        &self,
+        collection: &str,
+    ) -> Result<Vec<CollectionField>, MilvusError> {
+        let url = format!("{}/v2/vectordb/collections/describe", self.base_url);
+        let resp = self
+            .authed(self.http.post(url).json(&json!({ "collectionName": collection })))
+            .send()
+            .await?
+            .error_for_status()?;
+        let parsed: DescribeResponse = resp
+            .json()
+            .await
+            .map_err(|e| MilvusError::Decode(e.to_string()))?;
+        if parsed.code != 0 {
+            return Err(MilvusError::Api { code: parsed.code, message: parsed.message });
+        }
+        Ok(parsed
+            .data
+            .fields
+            .into_iter()
+            .map(|f| CollectionField {
+                is_vector: f.type_name.to_lowercase().contains("vector"),
+                name: f.name,
+                type_name: f.type_name,
+            })
+            .collect())
+    }
+
+    /// Run a single ANN search, retrying transient failures with jittered
+    /// backoff. `filter` is a Milvus boolean expression or None.
     pub async fn search(
         &self,
         coll: &MilvusCollection,
@@ -176,19 +252,21 @@ impl MilvusConnection {
             filter,
             search_params: json!({ "metricType": coll.metric }),
         };
+        let flip = coll.is_distance_metric();
 
         let mut attempt: u32 = 0;
         loop {
-            match self.try_search(&url, &body).await {
+            match self.try_search(&url, &body, flip).await {
                 Ok(hits) => return Ok(hits),
                 Err(e) if attempt < self.max_retries && e.is_retryable() => {
                     let backoff = self.retry_base * 2u32.saturating_pow(attempt);
+                    let jitter = Duration::from_millis((rand::random::<f64>() * 200.0) as u64);
                     tracing::warn!(
                         target: "connector_milvus",
                         attempt, collection = %coll.collection, error = %e,
-                        "milvus search failed; retrying after {backoff:?}"
+                        "milvus search failed; retrying after {:?}", backoff + jitter
                     );
-                    tokio::time::sleep(backoff).await;
+                    tokio::time::sleep(backoff + jitter).await;
                     attempt += 1;
                 }
                 Err(e) => return Err(e),
@@ -196,12 +274,13 @@ impl MilvusConnection {
         }
     }
 
-    async fn try_search(&self, url: &str, body: &SearchBody<'_>) -> Result<Vec<Hit>, MilvusError> {
-        let mut req = self.http.post(url).json(body);
-        if let Some(token) = &self.token {
-            req = req.bearer_auth(token);
-        }
-        let resp = req.send().await?.error_for_status()?;
+    async fn try_search(
+        &self,
+        url: &str,
+        body: &SearchBody<'_>,
+        flip_score: bool,
+    ) -> Result<Vec<Hit>, MilvusError> {
+        let resp = self.authed(self.http.post(url).json(body)).send().await?.error_for_status()?;
         let parsed: SearchResponse = resp
             .json()
             .await
@@ -213,11 +292,13 @@ impl MilvusConnection {
             .data
             .into_iter()
             .map(|mut row| {
-                let score = row
+                let raw = row
                     .remove("distance")
                     .or_else(|| row.remove("score"))
                     .and_then(|v| v.as_f64())
                     .unwrap_or(0.0) as f32;
+                // normalize so higher = more relevant for every metric
+                let score = if flip_score { -raw } else { raw };
                 Hit { fields: row, score }
             })
             .collect())

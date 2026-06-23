@@ -40,7 +40,7 @@ use datafusion::datasource::{TableProvider, TableType};
 use datafusion::logical_expr::{Expr, Operator, TableProviderFilterPushDown};
 use datafusion::physical_plan::ExecutionPlan;
 
-use crate::exec::{table_schema, MilvusExec};
+use crate::exec::MilvusExec;
 use crate::milvus::{MilvusCollection, MilvusConnection};
 
 const DEFAULT_TOP_K: usize = 50;
@@ -53,8 +53,10 @@ pub struct MilvusTableProvider {
 }
 
 impl MilvusTableProvider {
-    pub fn new(conn: Arc<MilvusConnection>, coll: MilvusCollection) -> Self {
-        Self { conn, coll, schema: table_schema() }
+    /// `schema` is built dynamically from the collection's introspected fields
+    /// (see lib.rs): query_vector (input) + the collection's scalar columns + score.
+    pub fn new(conn: Arc<MilvusConnection>, coll: MilvusCollection, schema: SchemaRef) -> Self {
+        Self { conn, coll, schema }
     }
 }
 
@@ -183,6 +185,7 @@ impl TableProvider for MilvusTableProvider {
         Ok(Arc::new(MilvusExec::new(
             Arc::clone(&self.conn),
             self.coll.clone(),
+            self.schema.clone(),
             query_vector,
             filter,
             top_k,

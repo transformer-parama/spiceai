@@ -36,13 +36,17 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::datasource::TableProvider;
 use runtime::component::dataset::Dataset;
 use runtime::dataconnector::{
-    ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory, DataConnectorResult,
+    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
+    DataConnectorResult,
 };
 use runtime::parameters::ParameterSpec;
 use secrecy::ExposeSecret;
+
+use crate::exec::arrow_type_for;
 
 use crate::milvus::{ConnectionConfig, MilvusCollection, MilvusConnection};
 use crate::table_provider::MilvusTableProvider;
@@ -108,14 +112,12 @@ const PARAMETERS: &[ParameterSpec] = &[
         .description("Retries for transient transport failures (timeouts/connection errors).")
         .default("2"),
     ParameterSpec::component("vector_field")
-        .description("Name of the float-vector field to search.")
-        .default("embedding"),
+        .description("Float-vector field to search (default: auto-detected from the collection)."),
     ParameterSpec::component("metric")
         .description("Distance metric: COSINE | L2 | IP.")
         .default("COSINE"),
     ParameterSpec::component("output_fields")
-        .description("Comma-separated scalar fields to return.")
-        .default("doc_type,source_id,product_id,title,text"),
+        .description("Comma-separated scalar fields to return (default: all scalar fields)."),
 ];
 
 impl DataConnectorFactory for MilvusFactory {
@@ -172,16 +174,16 @@ impl DataConnectorFactory for MilvusFactory {
             };
             let conn = Arc::new(MilvusConnection::new(cfg).map_err(|e| connect_err(e.to_string()))?);
 
-            let output_fields = p("output_fields")
-                .unwrap_or_else(|| "doc_type,source_id,product_id,title,text".to_string())
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect();
+            // vector_field / output_fields are OPTIONAL: when unset they're
+            // derived from collection introspection in read_provider (so the
+            // connector works for any collection without per-collection config).
+            let output_fields: Vec<String> = p("output_fields")
+                .map(|s| s.split(',').map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect())
+                .unwrap_or_default();
 
             Ok(Arc::new(MilvusConnector {
                 conn,
-                vector_field: p("vector_field").unwrap_or_else(|| "embedding".to_string()),
+                vector_field: p("vector_field").unwrap_or_default(),
                 metric: p("metric").unwrap_or_else(|| "COSINE".to_string()),
                 output_fields,
             }) as Arc<dyn DataConnector>)
@@ -208,13 +210,62 @@ impl DataConnector for MilvusConnector {
         dataset: &Dataset,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         // `from: milvus:<collection>` -> dataset.path() is the collection name.
-        let coll = MilvusCollection {
-            collection: dataset.path().to_string(),
-            vector_field: self.vector_field.clone(),
-            metric: self.metric.clone(),
-            output_fields: self.output_fields.clone(),
+        let collection = dataset.path().to_string();
+
+        let err = |msg: String| DataConnectorError::UnableToConnectInternal {
+            dataconnector: "milvus".to_string(),
+            connector_component: ConnectorComponent::from(dataset),
+            source: Box::<dyn std::error::Error + Send + Sync>::from(msg),
         };
-        Ok(Arc::new(MilvusTableProvider::new(Arc::clone(&self.conn), coll))
+
+        // Introspect the collection (also a reachability/existence check) and
+        // build the Arrow schema dynamically -- works for ANY collection layout.
+        let fields = self
+            .conn
+            .describe_collection(&collection)
+            .await
+            .map_err(|e| err(format!("describe collection '{collection}': {e}")))?;
+
+        // anns field: configured, else auto-detect the (first) vector field.
+        let vector_field = if !self.vector_field.is_empty() {
+            self.vector_field.clone()
+        } else {
+            fields
+                .iter()
+                .find(|f| f.is_vector)
+                .map(|f| f.name.clone())
+                .ok_or_else(|| err(format!("collection '{collection}' has no vector field")))?
+        };
+
+        // output columns: configured, else every scalar (non-vector) field.
+        let scalars: Vec<&_> = fields.iter().filter(|f| !f.is_vector).collect();
+        let output_fields: Vec<String> = if self.output_fields.is_empty() {
+            scalars.iter().map(|f| f.name.clone()).collect()
+        } else {
+            self.output_fields.clone()
+        };
+
+        // schema = query_vector (input) + typed output columns + score.
+        let mut arrow_fields = Vec::with_capacity(output_fields.len() + 2);
+        arrow_fields.push(Field::new("query_vector", DataType::Utf8, true));
+        for name in &output_fields {
+            let dt = scalars
+                .iter()
+                .find(|f| &f.name == name)
+                .map(|f| arrow_type_for(&f.type_name))
+                .unwrap_or(DataType::Utf8);
+            arrow_fields.push(Field::new(name, dt, true));
+        }
+        arrow_fields.push(Field::new("score", DataType::Float32, true));
+        let schema: SchemaRef = Arc::new(Schema::new(arrow_fields));
+
+        let coll = MilvusCollection {
+            collection,
+            vector_field,
+            metric: self.metric.clone(),
+            output_fields,
+        };
+        Ok(Arc::new(MilvusTableProvider::new(Arc::clone(&self.conn), coll, schema))
             as Arc<dyn TableProvider>)
     }
 }
