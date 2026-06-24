@@ -91,6 +91,8 @@ strips the prefix. Secrets should come from a Spice secret store.
 | `timeout_ms` | `10000` | Per-request timeout |
 | `connect_timeout_ms` | `3000` | Connection timeout |
 | `max_retries` | `2` | Retries on transient failures (timeouts/connection/5xx) |
+| `tls_ca_cert` | — | Path to a PEM CA cert to trust for TLS (internal CA / self-signed) |
+| `tls_skip_verify` | `false` | Skip TLS cert verification (DANGER; dev / self-signed only) |
 | `cypher` | — | Read Cypher defining the dataset → Cypher-passthrough mode (else path = node label) |
 
 ## Design notes

@@ -62,6 +62,10 @@ pub struct ConnectionConfig {
     pub timeout: Duration,
     pub connect_timeout: Duration,
     pub max_retries: u32,
+    /// Skip TLS certificate verification (DANGER; dev / self-signed only).
+    pub tls_skip_verify: bool,
+    /// Path to a PEM CA certificate to trust (internal CA / self-signed server).
+    pub tls_ca_cert_path: Option<String>,
 }
 
 /// What to *query* -- one Milvus collection.
@@ -206,11 +210,20 @@ struct DescribeResponse {
 
 impl MilvusConnection {
     pub fn new(cfg: ConnectionConfig) -> Result<Self, MilvusError> {
-        let http = reqwest::Client::builder()
+        let mut builder = reqwest::Client::builder()
             .timeout(cfg.timeout)
-            .connect_timeout(cfg.connect_timeout)
-            .build()
-            .map_err(|e| MilvusError::Build(e.to_string()))?;
+            .connect_timeout(cfg.connect_timeout);
+        if cfg.tls_skip_verify {
+            builder = builder.danger_accept_invalid_certs(true);
+        }
+        if let Some(path) = &cfg.tls_ca_cert_path {
+            let pem = std::fs::read(path)
+                .map_err(|e| MilvusError::Build(format!("read tls_ca_cert '{path}': {e}")))?;
+            let cert = reqwest::Certificate::from_pem(&pem)
+                .map_err(|e| MilvusError::Build(format!("parse tls_ca_cert '{path}': {e}")))?;
+            builder = builder.add_root_certificate(cert);
+        }
+        let http = builder.build().map_err(|e| MilvusError::Build(e.to_string()))?;
         let scheme = if cfg.secure { "https" } else { "http" };
         Ok(Self {
             http,
@@ -368,6 +381,8 @@ mod tests {
             timeout: Duration::from_secs(5),
             connect_timeout: Duration::from_secs(2),
             max_retries,
+            tls_skip_verify: false,
+            tls_ca_cert_path: None,
         })
         .unwrap()
     }
