@@ -111,6 +111,11 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("max_retries")
         .description("Retries for transient transport failures (timeouts/connection errors).")
         .default("2"),
+    ParameterSpec::component("tls_skip_verify")
+        .description("Skip TLS certificate verification (DANGER; dev / self-signed only).")
+        .default("false"),
+    ParameterSpec::component("tls_ca_cert")
+        .description("Path to a PEM CA cert to trust for TLS (internal CA / self-signed server)."),
     ParameterSpec::component("vector_field")
         .description("Float-vector field to search (default: auto-detected from the collection)."),
     ParameterSpec::component("metric")
@@ -171,6 +176,8 @@ impl DataConnectorFactory for MilvusFactory {
                 timeout: Duration::from_millis(u64_or("timeout_ms", 10_000)),
                 connect_timeout: Duration::from_millis(u64_or("connect_timeout_ms", 3_000)),
                 max_retries: u64_or("max_retries", 2) as u32,
+                tls_skip_verify: bool_flag("tls_skip_verify"),
+                tls_ca_cert_path: p("tls_ca_cert"),
             };
             let conn = Arc::new(MilvusConnection::new(cfg).map_err(|e| connect_err(e.to_string()))?);
 

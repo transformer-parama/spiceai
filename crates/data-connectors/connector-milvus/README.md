@@ -85,6 +85,8 @@ Spice strips the prefix. Secrets should come from a Spice secret store.
 | `timeout_ms` | `10000` | Per-request timeout |
 | `connect_timeout_ms` | `3000` | Connection timeout |
 | `max_retries` | `2` | Retries on transient failures (timeouts/connection/5xx) |
+| `tls_ca_cert` | — | Path to a PEM CA cert to trust for TLS (internal CA / self-signed) |
+| `tls_skip_verify` | `false` | Skip TLS cert verification (DANGER; dev / self-signed only) |
 | `metric` | `COSINE` | `COSINE` \| `L2` \| `IP` |
 | `vector_field` | *(auto-detected)* | Override the float-vector field to search |
 | `output_fields` | *(all scalar fields)* | Restrict the returned scalar columns |
@@ -100,8 +102,8 @@ Spice strips the prefix. Secrets should come from a Spice secret store.
 - **Pushdown:** `query_vector`, `product_id =`, `doc_type =`/`IN`, and column
   **projection** (only the projected scalar fields are fetched from Milvus).
 - **Observability:** `tracing` spans + OpenTelemetry metrics under the
-  `connector_milvus` meter (`milvus.search.requests` / `.errors` / `.retries` /
-  `.duration_seconds`).
+  `connector_milvus` meter (`milvus_search_requests` / `_errors` / `_retries` /
+  `_duration_ms`).
 
 ## Build & test
 
