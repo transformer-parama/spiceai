@@ -146,6 +146,9 @@ pub async fn register_external_connectors() {
     #[cfg(feature = "mysql")]
     register_connector_factory(connector_mysql::CONNECTOR_NAME, connector_mysql::factory()).await;
 
+    #[cfg(feature = "neo4j")]
+    register_connector_factory(connector_neo4j::CONNECTOR_NAME, connector_neo4j::factory()).await;
+
     #[cfg(feature = "nfs")]
     register_connector_factory(connector_nfs::CONNECTOR_NAME, connector_nfs::factory()).await;
 
