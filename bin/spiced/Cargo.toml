@@ -25,6 +25,7 @@ connector-sftp = { path = "../../crates/data-connectors/connector-sftp", optiona
 connector-mongodb = { path = "../../crates/data-connectors/connector-mongodb", optional = true }
 connector-mssql = { path = "../../crates/data-connectors/connector-mssql", optional = true }
 connector-mysql = { path = "../../crates/data-connectors/connector-mysql", optional = true }
+connector-milvus = { path = "../../crates/data-connectors/connector-milvus", optional = true }
 # connector-nfs requires system libnfs library - build separately with `nfs` feature
 connector-nfs = { path = "../../crates/data-connectors/connector-nfs", optional = true }
 connector-odbc = { path = "../../crates/data-connectors/connector-odbc", optional = true }
@@ -141,6 +142,7 @@ models = ["runtime/models"]
 mongodb = ["connector-mongodb", "runtime/mongodb"]
 mssql = ["connector-mssql", "runtime/mssql"]
 mysql = ["connector-mysql", "runtime/mysql"]
+milvus = ["connector-milvus"]
 # nfs feature requires system libnfs library and connector-nfs crate
 nfs = ["connector-nfs", "runtime/nfs"]
 odbc = ["connector-odbc"]
