@@ -206,6 +206,58 @@ impl TableProvider for Neo4jTableProvider {
     }
 }
 
+/// A Cypher-defined table (Phase 2): runs a fixed read Cypher statement and
+/// exposes its RETURN columns as a table -- supporting relationship traversals.
+/// The Cypher is opaque, so there is no predicate/LIMIT pushdown; DataFusion
+/// applies `WHERE`/`LIMIT` on top. Projection is honored (only projected columns
+/// are built). Schema is inferred at registration via `describe_cypher`.
+#[derive(Debug)]
+pub struct CypherTableProvider {
+    conn: Arc<Neo4jConnection>,
+    cypher: String,
+    schema: SchemaRef,
+}
+
+impl CypherTableProvider {
+    pub fn new(conn: Arc<Neo4jConnection>, cypher: String, schema: SchemaRef) -> Self {
+        Self { conn, cypher, schema }
+    }
+}
+
+#[async_trait]
+impl TableProvider for CypherTableProvider {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn schema(&self) -> SchemaRef {
+        self.schema.clone()
+    }
+    fn table_type(&self) -> TableType {
+        TableType::Base
+    }
+    // No supports_filters_pushdown override -> all filters Unsupported (default):
+    // the Cypher is opaque, so DataFusion applies WHERE/LIMIT itself.
+
+    async fn scan(
+        &self,
+        _state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        _filters: &[Expr],
+        _limit: Option<usize>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let projected_schema = match projection {
+            Some(idx) => Arc::new(self.schema.project(idx)?),
+            None => self.schema.clone(),
+        };
+        Ok(Arc::new(Neo4jExec::new(
+            Arc::clone(&self.conn),
+            self.cypher.clone(),
+            "cypher".to_string(),
+            projected_schema,
+        )))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

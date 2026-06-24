@@ -50,12 +50,14 @@ use secrecy::ExposeSecret;
 
 use crate::exec::arrow_type_for;
 use crate::neo4j::{ConnectionConfig, Neo4jConnection};
-use crate::table_provider::Neo4jTableProvider;
+use crate::table_provider::{CypherTableProvider, Neo4jTableProvider};
 
 /// Neo4j data connector. Holds a shared pooled connection; the node label is
-/// resolved per dataset in `read_provider`.
+/// resolved per dataset in `read_provider`. If a per-dataset `cypher` param is
+/// set, the dataset is a Cypher-defined table instead of a node label.
 pub struct Neo4jConnector {
     conn: Arc<Neo4jConnection>,
+    cypher: Option<String>,
 }
 
 impl std::fmt::Debug for Neo4jConnector {
@@ -107,6 +109,12 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("max_retries")
         .description("Retries for transient transport failures (timeouts/connection/5xx).")
         .default("2"),
+    ParameterSpec::component("cypher")
+        .description(
+            "Read Cypher statement defining the dataset (Phase 2: enables \
+             Cypher-passthrough incl. relationship traversals). When unset, the \
+             dataset path is treated as a node label.",
+        ),
 ];
 
 impl DataConnectorFactory for Neo4jFactory {
@@ -159,7 +167,7 @@ impl DataConnectorFactory for Neo4jFactory {
             };
             let conn = Arc::new(Neo4jConnection::new(cfg).map_err(|e| connect_err(e.to_string()))?);
 
-            Ok(Arc::new(Neo4jConnector { conn }) as Arc<dyn DataConnector>)
+            Ok(Arc::new(Neo4jConnector { conn, cypher: p("cypher") }) as Arc<dyn DataConnector>)
         })
     }
 
@@ -182,17 +190,43 @@ impl DataConnector for Neo4jConnector {
         &self,
         dataset: &Dataset,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
-        // `from: neo4j:<Label>` -> dataset.path() is the node label.
-        let label = dataset.path().to_string();
-
         let err = |msg: String| DataConnectorError::UnableToConnectInternal {
             dataconnector: "neo4j".to_string(),
             connector_component: ConnectorComponent::from(dataset),
             source: Box::<dyn std::error::Error + Send + Sync>::from(msg),
         };
 
-        // Introspect the label's properties (also a reachability/existence check)
-        // and build the Arrow schema dynamically -- works for ANY label.
+        let to_schema = |props: &[crate::neo4j::PropertyField]| -> SchemaRef {
+            Arc::new(Schema::new(
+                props
+                    .iter()
+                    .map(|p| Field::new(&p.name, arrow_type_for(&p.type_name), true))
+                    .collect::<Vec<Field>>(),
+            ))
+        };
+
+        // Phase 2: Cypher-passthrough mode -- a `cypher` param defines the table
+        // (supports relationship traversals). Schema inferred by sampling.
+        if let Some(cypher) = &self.cypher {
+            let props = self
+                .conn
+                .describe_cypher(cypher)
+                .await
+                .map_err(|e| err(format!("describe cypher: {e}")))?;
+            if props.is_empty() {
+                return Err(err("cypher returned no columns to infer a schema".to_string()));
+            }
+            return Ok(Arc::new(CypherTableProvider::new(
+                Arc::clone(&self.conn),
+                cypher.clone(),
+                to_schema(&props),
+            )) as Arc<dyn TableProvider>);
+        }
+
+        // Label mode: `from: neo4j:<Label>` -> dataset.path() is the node label.
+        // Introspect its properties (also a reachability/existence check) and
+        // build the Arrow schema dynamically -- works for ANY label.
+        let label = dataset.path().to_string();
         let props = self
             .conn
             .describe_label(&label)
@@ -205,13 +239,7 @@ impl DataConnector for Neo4jConnector {
             )));
         }
 
-        let arrow_fields: Vec<Field> = props
-            .iter()
-            .map(|p| Field::new(&p.name, arrow_type_for(&p.type_name), true))
-            .collect();
-        let schema: SchemaRef = Arc::new(Schema::new(arrow_fields));
-
-        Ok(Arc::new(Neo4jTableProvider::new(Arc::clone(&self.conn), label, schema))
+        Ok(Arc::new(Neo4jTableProvider::new(Arc::clone(&self.conn), label, to_schema(&props)))
             as Arc<dyn TableProvider>)
     }
 }

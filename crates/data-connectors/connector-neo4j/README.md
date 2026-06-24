@@ -5,10 +5,10 @@ A [Neo4j](https://neo4j.com) graph **data connector** for the
 label as a SQL table, so nodes can be queried in plain SQL and federated/joined
 alongside other Spice datasets.
 
-> **Status: experimental — Phase 1 (label-as-table).** Functional and verified
-> (unit + mock-network tests). A **Cypher-passthrough** mode (relationship
-> traversals / arbitrary Cypher) is planned as Phase 2. Not part of upstream
-> Spice. Built against Spice **v2.0.1** (DataFusion 52).
+> **Status: experimental.** Two modes implemented and verified (unit +
+> mock-network + live end-to-end): **node-label tables** and **Cypher-passthrough**
+> (relationship traversals). Not part of upstream Spice. Built against Spice
+> **v2.0.1** (DataFusion 52).
 
 ## What it does
 
@@ -51,6 +51,30 @@ and builds the Arrow schema:
 
 This works for **any** label — nothing is hardcoded.
 
+## Cypher passthrough (relationship traversals)
+
+For traversals or arbitrary read queries, give the dataset a `cypher` param
+instead of using the path as a label. The connector samples the query
+(`CALL { <cypher> } RETURN * LIMIT 1`) to infer the schema and exposes the RETURN
+columns as a table:
+
+```yaml
+  - from: neo4j:knows               # path is just a logical name in this mode
+    name: knows
+    acceleration: { enabled: false }
+    params:
+      neo4j_host: localhost
+      neo4j_cypher: "MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN a.name AS person, b.name AS friend"
+```
+
+```sql
+SELECT person, friend FROM knows WHERE person = 'Alice';
+```
+
+The Cypher is opaque, so there is **no predicate/LIMIT pushdown** — DataFusion
+applies `WHERE`/`LIMIT` on top; projection is still honored (only projected
+columns are built). The statement must be a single **read** query.
+
 ## Configuration
 
 Params are prefixed with the connector name (`neo4j_…`) in `spicepod.yaml`; Spice
@@ -67,6 +91,7 @@ strips the prefix. Secrets should come from a Spice secret store.
 | `timeout_ms` | `10000` | Per-request timeout |
 | `connect_timeout_ms` | `3000` | Connection timeout |
 | `max_retries` | `2` | Retries on transient failures (timeouts/connection/5xx) |
+| `cypher` | — | Read Cypher defining the dataset → Cypher-passthrough mode (else path = node label) |
 
 ## Design notes
 
@@ -100,8 +125,9 @@ pushdown / Cypher literal escaping.
 
 ## Limitations
 
-- **Phase 1 = node-label-as-table only.** No relationship traversals or arbitrary
-  Cypher yet — that's the planned **Cypher-passthrough** Phase 2.
+- **Cypher-passthrough mode has no pushdown** — the query is opaque, so `WHERE`,
+  `LIMIT`, and joins are applied by DataFusion on top (the full result is fetched
+  first). Use a bounded/efficient query. Label mode *does* push down predicates.
 - **Acceleration must be disabled** (`acceleration.enabled: false`) — else Spice
   materializes the rows and re-queries go to the accelerator, not Neo4j.
 - **A `LIMIT`-less scan returns all matching nodes** (standard table semantics);

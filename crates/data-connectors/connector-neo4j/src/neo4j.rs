@@ -227,14 +227,23 @@ impl Neo4jConnection {
         Ok(out)
     }
 
-    /// Run a Cypher statement (with optional parameters) and return the rows as
-    /// name->value maps. Retries transient failures with jittered backoff and
-    /// emits OpenTelemetry metrics.
+    /// Run a Cypher statement and return the rows as name->value maps.
     pub async fn run_query(
         &self,
         cypher: &str,
         params: Value,
     ) -> Result<Vec<Map<String, Value>>, Neo4jError> {
+        Ok(self.run_query_cols(cypher, params).await?.1)
+    }
+
+    /// Like [`run_query`] but also returns the result column names (in order,
+    /// present even when there are zero rows). Retries transient failures with
+    /// jittered backoff and emits OpenTelemetry metrics.
+    pub async fn run_query_cols(
+        &self,
+        cypher: &str,
+        params: Value,
+    ) -> Result<(Vec<String>, Vec<Map<String, Value>>), Neo4jError> {
         let attrs = [KeyValue::new("database", self.database.clone())];
         QUERY_REQUESTS.add(1, &attrs);
         let t0 = std::time::Instant::now();
@@ -246,11 +255,32 @@ impl Neo4jConnection {
         out
     }
 
+    /// Infer the schema of an arbitrary read Cypher query by sampling one row
+    /// (`CALL { <cypher> } RETURN * LIMIT 1`). Column names come from the result
+    /// columns (present even with no rows); types are inferred from the sample
+    /// value, defaulting to String.
+    pub async fn describe_cypher(&self, cypher: &str) -> Result<Vec<PropertyField>, Neo4jError> {
+        let probe = format!("CALL {{ {cypher} }} RETURN * LIMIT 1");
+        let (cols, rows) = self.run_query_cols(&probe, Value::Null).await?;
+        Ok(cols
+            .into_iter()
+            .map(|name| {
+                let type_name = rows
+                    .first()
+                    .and_then(|r| r.get(&name))
+                    .map(neo4j_type_of)
+                    .unwrap_or("String")
+                    .to_string();
+                PropertyField { name, type_name }
+            })
+            .collect())
+    }
+
     async fn run_retrying(
         &self,
         cypher: &str,
         params: Value,
-    ) -> Result<Vec<Map<String, Value>>, Neo4jError> {
+    ) -> Result<(Vec<String>, Vec<Map<String, Value>>), Neo4jError> {
         let url = format!("{}/db/{}/tx/commit", self.base_url, self.database);
         let body = json!({
             "statements": [{ "statement": cypher, "parameters": params }]
@@ -259,7 +289,7 @@ impl Neo4jConnection {
         let mut attempt: u32 = 0;
         loop {
             match self.try_run(&url, &body).await {
-                Ok(rows) => return Ok(rows),
+                Ok(out) => return Ok(out),
                 Err(e) if attempt < self.max_retries && e.is_retryable() => {
                     QUERY_RETRIES.add(1, &[KeyValue::new("database", self.database.clone())]);
                     let backoff = self.retry_base * 2u32.saturating_pow(attempt);
@@ -281,7 +311,7 @@ impl Neo4jConnection {
         &self,
         url: &str,
         body: &Value,
-    ) -> Result<Vec<Map<String, Value>>, Neo4jError> {
+    ) -> Result<(Vec<String>, Vec<Map<String, Value>>), Neo4jError> {
         let resp = self.authed(self.http.post(url).json(body)).send().await?.error_for_status()?;
         let parsed: TxResponse =
             resp.json().await.map_err(|e| Neo4jError::Decode(e.to_string()))?;
@@ -289,10 +319,10 @@ impl Neo4jConnection {
             return Err(Neo4jError::Api { code: err.code, message: err.message });
         }
         let Some(result) = parsed.results.into_iter().next() else {
-            return Ok(vec![]);
+            return Ok((vec![], vec![]));
         };
         let cols = result.columns;
-        Ok(result
+        let rows: Vec<Map<String, Value>> = result
             .data
             .into_iter()
             .map(|d| {
@@ -304,7 +334,24 @@ impl Neo4jConnection {
                 }
                 map
             })
-            .collect())
+            .collect();
+        Ok((cols, rows))
+    }
+}
+
+/// Infer a Neo4j-ish type name from a sampled JSON value (for Cypher-passthrough
+/// schema inference). Maps onward via `exec::arrow_type_for`.
+fn neo4j_type_of(v: &Value) -> &'static str {
+    match v {
+        Value::Bool(_) => "Boolean",
+        Value::Number(n) => {
+            if n.is_i64() || n.is_u64() {
+                "Long"
+            } else {
+                "Double"
+            }
+        }
+        _ => "String",
     }
 }
 
@@ -435,5 +482,31 @@ mod tests {
         assert_eq!(props[0].type_name, "String");
         assert_eq!(props[1].name, "age");
         assert_eq!(props[1].type_name, "Long");
+    }
+
+    #[tokio::test]
+    async fn describe_cypher_infers_columns_and_types() {
+        let s = MockServer::start().await;
+        // the probe (CALL { <cypher> } RETURN * LIMIT 1) returns columns + 1 row
+        Mock::given(method("POST"))
+            .and(path("/db/neo4j/tx/commit"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "results": [{
+                    "columns": ["person", "friends"],
+                    "data": [{"row": ["Alice", 3]}]
+                }],
+                "errors": []
+            })))
+            .mount(&s)
+            .await;
+        let props = conn(&s.uri(), None, 0)
+            .describe_cypher("MATCH (a:Person)-[:KNOWS]->(b) RETURN a.name AS person, count(b) AS friends")
+            .await
+            .unwrap();
+        assert_eq!(props.len(), 2);
+        assert_eq!(props[0].name, "person");
+        assert_eq!(props[0].type_name, "String");
+        assert_eq!(props[1].name, "friends");
+        assert_eq!(props[1].type_name, "Long"); // inferred from the sampled integer
     }
 }
