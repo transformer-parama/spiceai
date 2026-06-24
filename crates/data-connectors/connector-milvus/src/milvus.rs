@@ -33,22 +33,23 @@ use opentelemetry::metrics::{Counter, Histogram, Meter};
 use opentelemetry::{global, KeyValue};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use snafu::Snafu;
 
 // ---- OpenTelemetry metrics (flow into Spice's global meter provider) ----
 static METER: LazyLock<Meter> = LazyLock::new(|| global::meter("connector_milvus"));
 static SEARCH_REQUESTS: LazyLock<Counter<u64>> = LazyLock::new(|| {
-    METER.u64_counter("milvus.search.requests").with_description("Milvus ANN searches").build()
+    METER.u64_counter("milvus_search_requests").with_description("Milvus ANN searches").build()
 });
 static SEARCH_ERRORS: LazyLock<Counter<u64>> = LazyLock::new(|| {
-    METER.u64_counter("milvus.search.errors").with_description("Failed Milvus searches").build()
+    METER.u64_counter("milvus_search_errors").with_description("Failed Milvus searches").build()
 });
 static SEARCH_RETRIES: LazyLock<Counter<u64>> = LazyLock::new(|| {
-    METER.u64_counter("milvus.search.retries").with_description("Milvus search retries").build()
+    METER.u64_counter("milvus_search_retries").with_description("Milvus search retries").build()
 });
 static SEARCH_DURATION: LazyLock<Histogram<f64>> = LazyLock::new(|| {
     METER
-        .f64_histogram("milvus.search.duration_seconds")
-        .with_description("Milvus search wall-clock duration")
+        .f64_histogram("milvus_search_duration_ms")
+        .with_description("Milvus search wall-clock duration (ms)")
         .build()
 });
 
@@ -62,6 +63,10 @@ pub struct ConnectionConfig {
     pub timeout: Duration,
     pub connect_timeout: Duration,
     pub max_retries: u32,
+    /// Skip TLS certificate verification (DANGER; dev / self-signed only).
+    pub tls_skip_verify: bool,
+    /// Path to a PEM CA certificate to trust (internal CA / self-signed server).
+    pub tls_ca_cert_path: Option<String>,
 }
 
 /// What to *query* -- one Milvus collection.
@@ -109,29 +114,16 @@ impl std::fmt::Debug for MilvusConnection {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Snafu)]
 pub enum MilvusError {
-    Build(String),
-    Http(reqwest::Error),
+    #[snafu(display("milvus client build error: {message}"))]
+    Build { message: String },
+    #[snafu(display("milvus http error: {source}"), context(false))]
+    Http { source: reqwest::Error },
+    #[snafu(display("milvus api error {code}: {message}"))]
     Api { code: i64, message: String },
-    Decode(String),
-}
-
-impl std::fmt::Display for MilvusError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            MilvusError::Build(m) => write!(f, "milvus client build error: {m}"),
-            MilvusError::Http(e) => write!(f, "milvus http error: {e}"),
-            MilvusError::Api { code, message } => write!(f, "milvus api error {code}: {message}"),
-            MilvusError::Decode(m) => write!(f, "milvus decode error: {m}"),
-        }
-    }
-}
-impl std::error::Error for MilvusError {}
-impl From<reqwest::Error> for MilvusError {
-    fn from(e: reqwest::Error) -> Self {
-        MilvusError::Http(e)
-    }
+    #[snafu(display("milvus decode error: {message}"))]
+    Decode { message: String },
 }
 
 impl MilvusError {
@@ -139,11 +131,11 @@ impl MilvusError {
     /// 4xx -- those fail identically every time.
     fn is_retryable(&self) -> bool {
         match self {
-            MilvusError::Http(e) => {
-                e.is_timeout()
-                    || e.is_connect()
-                    || e.is_request()
-                    || e.status().is_some_and(|s| s.is_server_error())
+            MilvusError::Http { source } => {
+                source.is_timeout()
+                    || source.is_connect()
+                    || source.is_request()
+                    || source.status().is_some_and(|s| s.is_server_error())
             }
             _ => false,
         }
@@ -206,11 +198,20 @@ struct DescribeResponse {
 
 impl MilvusConnection {
     pub fn new(cfg: ConnectionConfig) -> Result<Self, MilvusError> {
-        let http = reqwest::Client::builder()
+        let mut builder = reqwest::Client::builder()
             .timeout(cfg.timeout)
-            .connect_timeout(cfg.connect_timeout)
-            .build()
-            .map_err(|e| MilvusError::Build(e.to_string()))?;
+            .connect_timeout(cfg.connect_timeout);
+        if cfg.tls_skip_verify {
+            builder = builder.danger_accept_invalid_certs(true);
+        }
+        if let Some(path) = &cfg.tls_ca_cert_path {
+            let pem = std::fs::read(path)
+                .map_err(|e| BuildSnafu { message: format!("read tls_ca_cert '{path}': {e}") }.build())?;
+            let cert = reqwest::Certificate::from_pem(&pem)
+                .map_err(|e| BuildSnafu { message: format!("parse tls_ca_cert '{path}': {e}") }.build())?;
+            builder = builder.add_root_certificate(cert);
+        }
+        let http = builder.build().map_err(|e| BuildSnafu { message: e.to_string() }.build())?;
         let scheme = if cfg.secure { "https" } else { "http" };
         Ok(Self {
             http,
@@ -244,9 +245,9 @@ impl MilvusConnection {
         let parsed: DescribeResponse = resp
             .json()
             .await
-            .map_err(|e| MilvusError::Decode(e.to_string()))?;
+            .map_err(|e| DecodeSnafu { message: e.to_string() }.build())?;
         if parsed.code != 0 {
-            return Err(MilvusError::Api { code: parsed.code, message: parsed.message });
+            return ApiSnafu { code: parsed.code, message: parsed.message }.fail();
         }
         Ok(parsed
             .data
@@ -273,7 +274,7 @@ impl MilvusConnection {
         SEARCH_REQUESTS.add(1, &attrs);
         let t0 = std::time::Instant::now();
         let out = self.search_retrying(coll, vector, limit, filter).await;
-        SEARCH_DURATION.record(t0.elapsed().as_secs_f64(), &attrs);
+        SEARCH_DURATION.record(t0.elapsed().as_secs_f64() * 1000.0, &attrs);
         if out.is_err() {
             SEARCH_ERRORS.add(1, &attrs);
         }
@@ -330,9 +331,9 @@ impl MilvusConnection {
         let parsed: SearchResponse = resp
             .json()
             .await
-            .map_err(|e| MilvusError::Decode(e.to_string()))?;
+            .map_err(|e| DecodeSnafu { message: e.to_string() }.build())?;
         if parsed.code != 0 {
-            return Err(MilvusError::Api { code: parsed.code, message: parsed.message });
+            return ApiSnafu { code: parsed.code, message: parsed.message }.fail();
         }
         Ok(parsed
             .data
@@ -368,6 +369,8 @@ mod tests {
             timeout: Duration::from_secs(5),
             connect_timeout: Duration::from_secs(2),
             max_retries,
+            tls_skip_verify: false,
+            tls_ca_cert_path: None,
         })
         .unwrap()
     }
@@ -464,7 +467,7 @@ mod tests {
             .mount(&s)
             .await;
         let err = conn(&s.uri(), None, 0).search(&coll("COSINE"), vec![0.0; 4], 1, None).await.unwrap_err();
-        assert!(matches!(err, MilvusError::Decode(_)));
+        assert!(matches!(err, MilvusError::Decode { .. }));
     }
 
     #[tokio::test]
