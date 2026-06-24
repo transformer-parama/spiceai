@@ -102,8 +102,8 @@ Spice strips the prefix. Secrets should come from a Spice secret store.
 - **Pushdown:** `query_vector`, `product_id =`, `doc_type =`/`IN`, and column
   **projection** (only the projected scalar fields are fetched from Milvus).
 - **Observability:** `tracing` spans + OpenTelemetry metrics under the
-  `connector_milvus` meter (`milvus.search.requests` / `.errors` / `.retries` /
-  `.duration_seconds`).
+  `connector_milvus` meter (`milvus_search_requests` / `_errors` / `_retries` /
+  `_duration_ms`).
 
 ## Build & test
 

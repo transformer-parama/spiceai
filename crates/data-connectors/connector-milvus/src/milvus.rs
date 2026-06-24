@@ -37,18 +37,18 @@ use serde_json::{json, Value};
 // ---- OpenTelemetry metrics (flow into Spice's global meter provider) ----
 static METER: LazyLock<Meter> = LazyLock::new(|| global::meter("connector_milvus"));
 static SEARCH_REQUESTS: LazyLock<Counter<u64>> = LazyLock::new(|| {
-    METER.u64_counter("milvus.search.requests").with_description("Milvus ANN searches").build()
+    METER.u64_counter("milvus_search_requests").with_description("Milvus ANN searches").build()
 });
 static SEARCH_ERRORS: LazyLock<Counter<u64>> = LazyLock::new(|| {
-    METER.u64_counter("milvus.search.errors").with_description("Failed Milvus searches").build()
+    METER.u64_counter("milvus_search_errors").with_description("Failed Milvus searches").build()
 });
 static SEARCH_RETRIES: LazyLock<Counter<u64>> = LazyLock::new(|| {
-    METER.u64_counter("milvus.search.retries").with_description("Milvus search retries").build()
+    METER.u64_counter("milvus_search_retries").with_description("Milvus search retries").build()
 });
 static SEARCH_DURATION: LazyLock<Histogram<f64>> = LazyLock::new(|| {
     METER
-        .f64_histogram("milvus.search.duration_seconds")
-        .with_description("Milvus search wall-clock duration")
+        .f64_histogram("milvus_search_duration_ms")
+        .with_description("Milvus search wall-clock duration (ms)")
         .build()
 });
 
@@ -286,7 +286,7 @@ impl MilvusConnection {
         SEARCH_REQUESTS.add(1, &attrs);
         let t0 = std::time::Instant::now();
         let out = self.search_retrying(coll, vector, limit, filter).await;
-        SEARCH_DURATION.record(t0.elapsed().as_secs_f64(), &attrs);
+        SEARCH_DURATION.record(t0.elapsed().as_secs_f64() * 1000.0, &attrs);
         if out.is_err() {
             SEARCH_ERRORS.add(1, &attrs);
         }

@@ -39,18 +39,18 @@ use serde_json::{json, Map, Value};
 // ---- OpenTelemetry metrics (flow into Spice's global meter provider) ----
 static METER: LazyLock<Meter> = LazyLock::new(|| global::meter("connector_neo4j"));
 static QUERY_REQUESTS: LazyLock<Counter<u64>> = LazyLock::new(|| {
-    METER.u64_counter("neo4j.query.requests").with_description("Neo4j Cypher queries").build()
+    METER.u64_counter("neo4j_query_requests").with_description("Neo4j Cypher queries").build()
 });
 static QUERY_ERRORS: LazyLock<Counter<u64>> = LazyLock::new(|| {
-    METER.u64_counter("neo4j.query.errors").with_description("Failed Neo4j queries").build()
+    METER.u64_counter("neo4j_query_errors").with_description("Failed Neo4j queries").build()
 });
 static QUERY_RETRIES: LazyLock<Counter<u64>> = LazyLock::new(|| {
-    METER.u64_counter("neo4j.query.retries").with_description("Neo4j query retries").build()
+    METER.u64_counter("neo4j_query_retries").with_description("Neo4j query retries").build()
 });
 static QUERY_DURATION: LazyLock<Histogram<f64>> = LazyLock::new(|| {
     METER
-        .f64_histogram("neo4j.query.duration_seconds")
-        .with_description("Neo4j query wall-clock duration")
+        .f64_histogram("neo4j_query_duration_ms")
+        .with_description("Neo4j query wall-clock duration (ms)")
         .build()
 });
 
@@ -261,7 +261,7 @@ impl Neo4jConnection {
         QUERY_REQUESTS.add(1, &attrs);
         let t0 = std::time::Instant::now();
         let out = self.run_retrying(cypher, params).await;
-        QUERY_DURATION.record(t0.elapsed().as_secs_f64(), &attrs);
+        QUERY_DURATION.record(t0.elapsed().as_secs_f64() * 1000.0, &attrs);
         if out.is_err() {
             QUERY_ERRORS.add(1, &attrs);
         }

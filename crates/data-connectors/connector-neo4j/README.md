@@ -108,8 +108,8 @@ strips the prefix. Secrets should come from a Spice secret store.
   property columns, column **projection** (RETURN only projected props), and
   `LIMIT`.
 - **Observability:** `tracing` spans + OpenTelemetry metrics under the
-  `connector_neo4j` meter (`neo4j.query.requests` / `.errors` / `.retries` /
-  `.duration_seconds`).
+  `connector_neo4j` meter (`neo4j_query_requests` / `_errors` / `_retries` /
+  `_duration_ms`).
 
 ## Build & test
 
