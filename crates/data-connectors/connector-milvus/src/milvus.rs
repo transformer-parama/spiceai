@@ -33,6 +33,7 @@ use opentelemetry::metrics::{Counter, Histogram, Meter};
 use opentelemetry::{global, KeyValue};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use snafu::Snafu;
 
 // ---- OpenTelemetry metrics (flow into Spice's global meter provider) ----
 static METER: LazyLock<Meter> = LazyLock::new(|| global::meter("connector_milvus"));
@@ -113,29 +114,16 @@ impl std::fmt::Debug for MilvusConnection {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Snafu)]
 pub enum MilvusError {
-    Build(String),
-    Http(reqwest::Error),
+    #[snafu(display("milvus client build error: {message}"))]
+    Build { message: String },
+    #[snafu(display("milvus http error: {source}"), context(false))]
+    Http { source: reqwest::Error },
+    #[snafu(display("milvus api error {code}: {message}"))]
     Api { code: i64, message: String },
-    Decode(String),
-}
-
-impl std::fmt::Display for MilvusError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            MilvusError::Build(m) => write!(f, "milvus client build error: {m}"),
-            MilvusError::Http(e) => write!(f, "milvus http error: {e}"),
-            MilvusError::Api { code, message } => write!(f, "milvus api error {code}: {message}"),
-            MilvusError::Decode(m) => write!(f, "milvus decode error: {m}"),
-        }
-    }
-}
-impl std::error::Error for MilvusError {}
-impl From<reqwest::Error> for MilvusError {
-    fn from(e: reqwest::Error) -> Self {
-        MilvusError::Http(e)
-    }
+    #[snafu(display("milvus decode error: {message}"))]
+    Decode { message: String },
 }
 
 impl MilvusError {
@@ -143,11 +131,11 @@ impl MilvusError {
     /// 4xx -- those fail identically every time.
     fn is_retryable(&self) -> bool {
         match self {
-            MilvusError::Http(e) => {
-                e.is_timeout()
-                    || e.is_connect()
-                    || e.is_request()
-                    || e.status().is_some_and(|s| s.is_server_error())
+            MilvusError::Http { source } => {
+                source.is_timeout()
+                    || source.is_connect()
+                    || source.is_request()
+                    || source.status().is_some_and(|s| s.is_server_error())
             }
             _ => false,
         }
@@ -218,12 +206,12 @@ impl MilvusConnection {
         }
         if let Some(path) = &cfg.tls_ca_cert_path {
             let pem = std::fs::read(path)
-                .map_err(|e| MilvusError::Build(format!("read tls_ca_cert '{path}': {e}")))?;
+                .map_err(|e| BuildSnafu { message: format!("read tls_ca_cert '{path}': {e}") }.build())?;
             let cert = reqwest::Certificate::from_pem(&pem)
-                .map_err(|e| MilvusError::Build(format!("parse tls_ca_cert '{path}': {e}")))?;
+                .map_err(|e| BuildSnafu { message: format!("parse tls_ca_cert '{path}': {e}") }.build())?;
             builder = builder.add_root_certificate(cert);
         }
-        let http = builder.build().map_err(|e| MilvusError::Build(e.to_string()))?;
+        let http = builder.build().map_err(|e| BuildSnafu { message: e.to_string() }.build())?;
         let scheme = if cfg.secure { "https" } else { "http" };
         Ok(Self {
             http,
@@ -257,9 +245,9 @@ impl MilvusConnection {
         let parsed: DescribeResponse = resp
             .json()
             .await
-            .map_err(|e| MilvusError::Decode(e.to_string()))?;
+            .map_err(|e| DecodeSnafu { message: e.to_string() }.build())?;
         if parsed.code != 0 {
-            return Err(MilvusError::Api { code: parsed.code, message: parsed.message });
+            return ApiSnafu { code: parsed.code, message: parsed.message }.fail();
         }
         Ok(parsed
             .data
@@ -343,9 +331,9 @@ impl MilvusConnection {
         let parsed: SearchResponse = resp
             .json()
             .await
-            .map_err(|e| MilvusError::Decode(e.to_string()))?;
+            .map_err(|e| DecodeSnafu { message: e.to_string() }.build())?;
         if parsed.code != 0 {
-            return Err(MilvusError::Api { code: parsed.code, message: parsed.message });
+            return ApiSnafu { code: parsed.code, message: parsed.message }.fail();
         }
         Ok(parsed
             .data
@@ -479,7 +467,7 @@ mod tests {
             .mount(&s)
             .await;
         let err = conn(&s.uri(), None, 0).search(&coll("COSINE"), vec![0.0; 4], 1, None).await.unwrap_err();
-        assert!(matches!(err, MilvusError::Decode(_)));
+        assert!(matches!(err, MilvusError::Decode { .. }));
     }
 
     #[tokio::test]
