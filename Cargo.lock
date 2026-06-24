@@ -4186,6 +4186,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "connector-neo4j"
+version = "2.0.1"
+dependencies = [
+ "async-trait",
+ "datafusion",
+ "futures",
+ "opentelemetry",
+ "rand 0.10.1",
+ "reqwest 0.12.24",
+ "runtime",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "wiremock",
+]
+
+[[package]]
 name = "connector-nfs"
 version = "1.11.0-unstable"
 dependencies = [
@@ -18154,6 +18173,7 @@ dependencies = [
  "connector-mongodb",
  "connector-mssql",
  "connector-mysql",
+ "connector-neo4j",
  "connector-nfs",
  "connector-odbc",
  "connector-oracle",

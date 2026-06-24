@@ -22,6 +22,7 @@ connector-ftp = { path = "../../crates/data-connectors/connector-ftp", optional 
 connector-graphql = { path = "../../crates/data-connectors/connector-graphql" }
 connector-imap = { path = "../../crates/data-connectors/connector-imap", optional = true }
 connector-milvus = { path = "../../crates/data-connectors/connector-milvus", optional = true }
+connector-neo4j = { path = "../../crates/data-connectors/connector-neo4j", optional = true }
 connector-sftp = { path = "../../crates/data-connectors/connector-sftp", optional = true }
 connector-mongodb = { path = "../../crates/data-connectors/connector-mongodb", optional = true }
 connector-mssql = { path = "../../crates/data-connectors/connector-mssql", optional = true }
@@ -129,6 +130,7 @@ flightsql = ["connector-flightsql", "runtime/flightsql"]
 ftp = ["connector-ftp", "runtime/ftp"]
 geo = ["runtime/geo"]
 milvus = ["connector-milvus"]
+neo4j = ["connector-neo4j"]
 http-functions = ["runtime/http-functions"]
 rate-control = ["runtime/rate-control"]
 wasm-functions = ["runtime/wasm-functions"]
