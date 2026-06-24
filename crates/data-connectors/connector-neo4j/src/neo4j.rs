@@ -35,6 +35,7 @@ use opentelemetry::metrics::{Counter, Histogram, Meter};
 use opentelemetry::{global, KeyValue};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
+use snafu::Snafu;
 
 // ---- OpenTelemetry metrics (flow into Spice's global meter provider) ----
 static METER: LazyLock<Meter> = LazyLock::new(|| global::meter("connector_neo4j"));
@@ -101,31 +102,18 @@ impl std::fmt::Debug for Neo4jConnection {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Snafu)]
 pub enum Neo4jError {
-    Build(String),
-    Http(reqwest::Error),
+    #[snafu(display("neo4j client build error: {message}"))]
+    Build { message: String },
+    #[snafu(display("neo4j http error: {source}"), context(false))]
+    Http { source: reqwest::Error },
     /// A Cypher/server error (Neo4j error codes are strings, e.g.
     /// `Neo.ClientError.Statement.SyntaxError`).
+    #[snafu(display("neo4j api error {code}: {message}"))]
     Api { code: String, message: String },
-    Decode(String),
-}
-
-impl std::fmt::Display for Neo4jError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Neo4jError::Build(m) => write!(f, "neo4j client build error: {m}"),
-            Neo4jError::Http(e) => write!(f, "neo4j http error: {e}"),
-            Neo4jError::Api { code, message } => write!(f, "neo4j api error {code}: {message}"),
-            Neo4jError::Decode(m) => write!(f, "neo4j decode error: {m}"),
-        }
-    }
-}
-impl std::error::Error for Neo4jError {}
-impl From<reqwest::Error> for Neo4jError {
-    fn from(e: reqwest::Error) -> Self {
-        Neo4jError::Http(e)
-    }
+    #[snafu(display("neo4j decode error: {message}"))]
+    Decode { message: String },
 }
 
 impl Neo4jError {
@@ -133,11 +121,11 @@ impl Neo4jError {
     /// those fail identically every time.
     fn is_retryable(&self) -> bool {
         match self {
-            Neo4jError::Http(e) => {
-                e.is_timeout()
-                    || e.is_connect()
-                    || e.is_request()
-                    || e.status().is_some_and(|s| s.is_server_error())
+            Neo4jError::Http { source } => {
+                source.is_timeout()
+                    || source.is_connect()
+                    || source.is_request()
+                    || source.status().is_some_and(|s| s.is_server_error())
             }
             _ => false,
         }
@@ -185,12 +173,12 @@ impl Neo4jConnection {
         }
         if let Some(path) = &cfg.tls_ca_cert_path {
             let pem = std::fs::read(path)
-                .map_err(|e| Neo4jError::Build(format!("read tls_ca_cert '{path}': {e}")))?;
+                .map_err(|e| BuildSnafu { message: format!("read tls_ca_cert '{path}': {e}") }.build())?;
             let cert = reqwest::Certificate::from_pem(&pem)
-                .map_err(|e| Neo4jError::Build(format!("parse tls_ca_cert '{path}': {e}")))?;
+                .map_err(|e| BuildSnafu { message: format!("parse tls_ca_cert '{path}': {e}") }.build())?;
             builder = builder.add_root_certificate(cert);
         }
-        let http = builder.build().map_err(|e| Neo4jError::Build(e.to_string()))?;
+        let http = builder.build().map_err(|e| BuildSnafu { message: e.to_string() }.build())?;
         let scheme = if cfg.secure { "https" } else { "http" };
         let auth = match (cfg.username, cfg.password) {
             (Some(u), Some(p)) => Some((u, p)),
@@ -327,9 +315,9 @@ impl Neo4jConnection {
     ) -> Result<(Vec<String>, Vec<Map<String, Value>>), Neo4jError> {
         let resp = self.authed(self.http.post(url).json(body)).send().await?.error_for_status()?;
         let parsed: TxResponse =
-            resp.json().await.map_err(|e| Neo4jError::Decode(e.to_string()))?;
+            resp.json().await.map_err(|e| DecodeSnafu { message: e.to_string() }.build())?;
         if let Some(err) = parsed.errors.into_iter().next() {
-            return Err(Neo4jError::Api { code: err.code, message: err.message });
+            return ApiSnafu { code: err.code, message: err.message }.fail();
         }
         let Some(result) = parsed.results.into_iter().next() else {
             return Ok((vec![], vec![]));
@@ -471,7 +459,7 @@ mod tests {
             .mount(&s)
             .await;
         let err = conn(&s.uri(), None, 0).run_query("RETURN 1", Value::Null).await.unwrap_err();
-        assert!(matches!(err, Neo4jError::Decode(_)));
+        assert!(matches!(err, Neo4jError::Decode { .. }));
     }
 
     #[tokio::test]
