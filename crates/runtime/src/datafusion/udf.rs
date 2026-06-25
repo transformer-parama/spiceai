@@ -152,7 +152,14 @@ pub async fn register_udfs(runtime: &crate::Runtime) {
 
     #[cfg(feature = "models")]
     {
-        ctx.register_udf(embed::Embed::new(runtime.embeds()).into());
+        // Register `embed` as an async UDF so network-backed (remote) embedding
+        // models can be invoked inside a query without deadlocking a worker
+        // thread on a blocking `embed_sync` call. Mirrors the `ai` UDF below.
+        ctx.register_udf(
+            embed::Embed::new(runtime.embeds())
+                .into_async_udf()
+                .into_scalar_udf(),
+        );
         ctx.register_udf(
             Ai::new(runtime.completion_llms(), runtime.model_rate_controllers())
                 .into_async_udf()

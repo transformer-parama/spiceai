@@ -21,8 +21,10 @@ use arrow::array::{ListBuilder, PrimitiveBuilder};
 use arrow::datatypes::Float32Type;
 use arrow_schema::{DataType, Field};
 use async_openai::types::embeddings::EmbeddingInput;
+use async_trait::async_trait;
 use datafusion::common::cast::{as_large_string_array, as_list_array, as_string_array};
 use datafusion::error::DataFusionError;
+use datafusion::logical_expr::async_udf::{AsyncScalarUDF, AsyncScalarUDFImpl};
 use datafusion::logical_expr::{DocSection, Documentation, ScalarFunctionArgs};
 use datafusion::scalar::ScalarValue;
 use datafusion::{
@@ -109,6 +111,70 @@ impl Embed {
     pub fn new(model_store: Arc<RwLock<EmbeddingModelStore>>) -> Self {
         let ptr = Arc::as_ptr(&model_store).addr() as u64;
         Self { model_store, ptr }
+    }
+
+    #[must_use]
+    pub fn into_async_udf(self) -> AsyncScalarUDF {
+        AsyncScalarUDF::new(Arc::new(self))
+    }
+
+    /// Async counterpart of [`Self::embed_single`]. Awaits the model's async
+    /// `embed` instead of the blocking `embed_sync`, so remote (network-backed)
+    /// embedding models work inside a query without deadlocking a worker thread.
+    async fn embed_single_async(
+        model: &dyn llms::embeddings::Embed,
+        sentence: &str,
+    ) -> DataFusionResult<ColumnarValue> {
+        let embedding = model
+            .embed(EmbeddingInput::String(sentence.to_owned()))
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+        let first_embedding = embedding.first().ok_or_else(|| {
+            DataFusionError::Execution(
+                "Embedding model returned empty result for input text (contract violation)"
+                    .to_string(),
+            )
+        })?;
+
+        let vector_size = first_embedding.len();
+
+        let mut builder = ListBuilder::with_capacity(
+            PrimitiveBuilder::<Float32Type>::with_capacity(vector_size),
+            1,
+        );
+
+        builder.values().append_slice(first_embedding);
+        builder.append(true);
+
+        Ok(ColumnarValue::Array(Arc::new(builder.finish())))
+    }
+
+    /// Async counterpart of [`Self::embed_multiple`]. Takes owned strings so no
+    /// borrow is held across an `.await`.
+    async fn embed_multiple_async(
+        model: &dyn llms::embeddings::Embed,
+        sentences: Vec<Option<String>>,
+    ) -> DataFusionResult<ColumnarValue> {
+        let mut builder =
+            ListBuilder::new(ListBuilder::new(PrimitiveBuilder::<Float32Type>::new()));
+
+        for maybe_string in sentences {
+            let embedded = match maybe_string {
+                Some(s) => model
+                    .embed(EmbeddingInput::String(s))
+                    .await
+                    .map_err(|e| DataFusionError::External(Box::new(e)))?,
+                None => vec![vec![]],
+            };
+
+            builder.values().values().append_slice(&embedded[0]);
+            builder.values().append(!embedded[0].is_empty());
+        }
+
+        builder.append(true);
+
+        Ok(ColumnarValue::Array(Arc::new(builder.finish())))
     }
 
     fn embed_single(
@@ -269,6 +335,93 @@ impl ScalarUDFImpl for Embed {
 
     fn documentation(&self) -> Option<&Documentation> {
         Some(&DOCUMENTATION)
+    }
+}
+
+#[async_trait]
+impl AsyncScalarUDFImpl for Embed {
+    async fn invoke_async_with_args(
+        &self,
+        args: ScalarFunctionArgs,
+    ) -> DataFusionResult<ColumnarValue> {
+        if args.args.len() != 2 {
+            return exec_err!(
+                "{EMBED_UDF_NAME} expects exactly two arguments: text and model_name"
+            );
+        }
+
+        let text_arg = &args.args[0];
+        let model_arg = &args.args[1];
+
+        let ColumnarValue::Scalar(ScalarValue::Utf8(Some(model_name))) = model_arg else {
+            return exec_err!("{EMBED_UDF_NAME} unsupported model parameter: {model_arg}");
+        };
+
+        // Clone the model Arc out so we don't hold the lock guard across an await.
+        let model = {
+            let model_store = self.model_store.read().await;
+            let Some(model) = model_store.get(model_name) else {
+                return exec_err!("{EMBED_UDF_NAME} cannot mount {model_arg}");
+            };
+            Arc::clone(model)
+        };
+
+        match text_arg {
+            // An array representing multiple rows
+            ColumnarValue::Array(arr) => {
+                let sentences: Vec<Option<String>> =
+                    string_array_iter!(arr).map(|s| s.map(str::to_owned)).collect();
+                let ColumnarValue::Array(embeddings) =
+                    Self::embed_multiple_async(&*model, sentences).await?
+                else {
+                    unreachable!(
+                        "{EMBED_UDF_NAME}: embed_multiple_async must return ColumnarValue::Array by contract"
+                    );
+                };
+
+                // Unpack the inner list (i.e. as used for single row, multiple input below)
+                let list_array = as_list_array(&*embeddings)?;
+                if list_array.is_empty() {
+                    return exec_err!("{EMBED_UDF_NAME}: embedding result array is empty");
+                }
+                Ok(ColumnarValue::Array(Arc::new(list_array.value(0))))
+            }
+            // A single text value
+            ColumnarValue::Scalar(
+                ScalarValue::Utf8(Some(text)) | ScalarValue::LargeUtf8(Some(text)),
+            ) => Self::embed_single_async(&*model, text).await,
+            // Various combinations of single row/multiple input
+            ColumnarValue::Scalar(ScalarValue::LargeList(arr)) => {
+                if arr.is_empty() {
+                    return exec_err!("{EMBED_UDF_NAME}: scalar list array is empty");
+                }
+                let inner_array = arr.value(0);
+                let sentences: Vec<Option<String>> =
+                    string_array_iter!(&inner_array).map(|s| s.map(str::to_owned)).collect();
+                Self::embed_multiple_async(&*model, sentences).await
+            }
+            ColumnarValue::Scalar(ScalarValue::List(arr)) => {
+                if arr.is_empty() {
+                    return exec_err!("{EMBED_UDF_NAME}: scalar list array is empty");
+                }
+                let inner_array = arr.value(0);
+                let sentences: Vec<Option<String>> =
+                    string_array_iter!(&inner_array).map(|s| s.map(str::to_owned)).collect();
+                Self::embed_multiple_async(&*model, sentences).await
+            }
+            ColumnarValue::Scalar(ScalarValue::FixedSizeList(arr)) => {
+                if arr.is_empty() {
+                    return exec_err!("{EMBED_UDF_NAME}: scalar list array is empty");
+                }
+                let inner_array = arr.value(0);
+                let sentences: Vec<Option<String>> =
+                    string_array_iter!(&inner_array).map(|s| s.map(str::to_owned)).collect();
+                Self::embed_multiple_async(&*model, sentences).await
+            }
+            unsupported_text_arg @ ColumnarValue::Scalar(_) => {
+                exec_err!("Unsupported text argument: {unsupported_text_arg}")
+            }
+        }
     }
 }
 
