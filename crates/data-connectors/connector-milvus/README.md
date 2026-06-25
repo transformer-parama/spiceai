@@ -34,10 +34,11 @@ Query it with the query embedding in a `query_vector = '[...]'` predicate;
 Milvus as a boolean filter:
 
 ```sql
-SELECT doc_type, source_id, title, score
+SELECT category, title, score
 FROM documents
 WHERE query_vector = '[0.013, -0.021, ...]'   -- the query embedding (JSON array)
-  AND doc_type IN ('ticket')                   -- optional → Milvus filter
+  AND category IN ('news', 'blog')             -- optional → Milvus filter (any scalar column)
+  AND year > 2000                              -- comparisons push down too
 LIMIT 10;
 ```
 
@@ -99,8 +100,9 @@ Spice strips the prefix. Secrets should come from a Spice secret store.
   retried with **jittered** exponential backoff; API errors (`code != 0`) and
   4xx are returned immediately. `describe` at registration is a startup
   reachability/existence check.
-- **Pushdown:** `query_vector`, `product_id =`, `doc_type =`/`IN`, and column
-  **projection** (only the projected scalar fields are fetched from Milvus).
+- **Pushdown:** the `query_vector` search predicate; comparison (`=`,`!=`,`<`,
+  `<=`,`>`,`>=`) / `IN` filters on **any** scalar column (schema-driven, nothing
+  hardcoded); and column **projection** (only projected scalar fields are fetched).
 - **Observability:** `tracing` spans + OpenTelemetry metrics under the
   `connector_milvus` meter (`milvus_search_requests` / `_errors` / `_retries` /
   `_duration_ms`).
@@ -112,7 +114,7 @@ Spice strips the prefix. Secrets should come from a Spice secret store.
 cargo test -p connector-milvus
 
 # build into spiced (from the spiceai workspace root)
-make -C bin/spiced SPICED_CUSTOM_FEATURES="postgres milvus"
+cargo build --release -p spiced --features milvus
 ```
 
 Tests cover: predicate extraction & Milvus-filter building, distance→score
@@ -125,8 +127,8 @@ header, malformed-JSON handling, and `describe` parsing/vector detection.
   materializes the rows into DuckDB/SQLite and the ANN index is lost.
 - **Query interface is a convention** (`query_vector = '[...]'`), not standard
   SQL — see the contract section above.
-- **No live-Milvus integration test in this crate's CI** — covered by the app's
-  `scripts/integration_test.py` against a deployed stack.
+- **No live-Milvus integration test in this crate's CI** — unit + mock-network
+  only; live testing is done against a deployed stack by the consumer.
 - **Fork connector** — pinned to Spice v2.0.1; carries rebase maintenance until
   upstreamed.
 

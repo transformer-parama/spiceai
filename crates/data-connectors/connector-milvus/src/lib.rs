@@ -17,9 +17,9 @@ limitations under the License.
 //! Milvus data connector for the Spice.ai runtime.
 //!
 //! Exposes a Milvus collection as a SQL table; an ANN search is expressed as
-//! `... WHERE query_vector = '[...]' [AND product_id = N] [AND doc_type IN (...)]
-//! LIMIT k`. The query vector, filters, and limit are pushed into a single
-//! Milvus `search()` call. Keep `acceleration.enabled: false` for the dataset.
+//! `... WHERE query_vector = '[...]' [AND <scalar_col> = <v>] [AND <scalar_col> IN (...)]
+//! LIMIT k`. The query vector, scalar filters (any column), and limit are pushed
+//! into a single Milvus `search()` call. Keep `acceleration.enabled: false`.
 //!
 //! A single pooled, timeout-bounded connection (with optional bearer auth + TLS
 //! and transient-failure retries) is built once and shared across all datasets
