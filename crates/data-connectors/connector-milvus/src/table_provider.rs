@@ -17,17 +17,18 @@ limitations under the License.
 //! `MilvusTableProvider` -- exposes a Milvus collection as a DataFusion table.
 //!
 //! ```text
-//! SELECT doc_type, source_id, product_id, title, text, score
-//! FROM documents
+//! SELECT <scalar columns>, score
+//! FROM <collection>
 //! WHERE query_vector = '[0.01, -0.02, ...]'   -- the query embedding (JSON)
-//!   AND product_id = 3                          -- optional -> Milvus filter
-//!   AND doc_type IN ('ticket')                  -- optional -> Milvus filter
+//!   AND <scalar_col> = <value>                 -- optional -> Milvus filter
+//!   AND <scalar_col> IN (...)                  -- optional -> Milvus filter
 //! LIMIT 50                                       -- -> Milvus top-k
 //! ```
 //!
-//! `query_vector = '...'` carries the search vector; `product_id` / `doc_type`
-//! predicates are translated into a Milvus boolean filter. All consumed
-//! predicates are reported `Exact` so DataFusion does not re-apply them.
+//! `query_vector = '...'` carries the search vector; equality/comparison/`IN`
+//! predicates on **any** scalar column (introspected from the collection) are
+//! translated into a Milvus boolean filter. All consumed predicates are reported
+//! `Exact` so DataFusion does not re-apply them.
 
 use std::sync::Arc;
 
@@ -89,43 +90,77 @@ fn milvus_str(s: &str) -> String {
     format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
-/// Translate `product_id`/`doc_type` predicates into a Milvus boolean filter.
-fn extract_milvus_filter(filters: &[Expr]) -> Option<String> {
-    let mut parts: Vec<String> = Vec::new();
-    for f in filters {
-        if let Expr::BinaryExpr(b) = f {
-            if b.op == Operator::Eq {
-                if let Expr::Column(c) = b.left.as_ref() {
-                    match (c.name.as_str(), b.right.as_ref()) {
-                        ("product_id", Expr::Literal(ScalarValue::Int64(Some(v)), _)) => {
-                            parts.push(format!("product_id == {v}"));
-                        }
-                        ("doc_type", Expr::Literal(ScalarValue::Utf8(Some(s)), _)) => {
-                            parts.push(format!("doc_type == {}", milvus_str(s)));
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
-        if let Expr::InList(il) = f {
-            if let Expr::Column(c) = il.expr.as_ref() {
-                if c.name == "doc_type" && !il.negated {
-                    let vals: Vec<String> = il
-                        .list
-                        .iter()
-                        .filter_map(|e| match e {
-                            Expr::Literal(ScalarValue::Utf8(Some(s)), _) => Some(milvus_str(s)),
-                            _ => None,
-                        })
-                        .collect();
-                    if !vals.is_empty() {
-                        parts.push(format!("doc_type in [{}]", vals.join(",")));
-                    }
-                }
-            }
-        }
+/// Render a scalar literal as a Milvus boolean-expression value, or None if the
+/// type isn't pushable.
+fn milvus_value(v: &ScalarValue) -> Option<String> {
+    match v {
+        ScalarValue::Utf8(Some(s)) | ScalarValue::LargeUtf8(Some(s)) => Some(milvus_str(s)),
+        ScalarValue::Int64(Some(n)) => Some(n.to_string()),
+        ScalarValue::Int32(Some(n)) => Some(n.to_string()),
+        ScalarValue::Float64(Some(n)) => Some(n.to_string()),
+        ScalarValue::Float32(Some(n)) => Some(n.to_string()),
+        ScalarValue::Boolean(Some(b)) => Some(b.to_string()),
+        _ => None,
     }
+}
+
+fn milvus_op(op: Operator) -> Option<&'static str> {
+    match op {
+        Operator::Eq => Some("=="),
+        Operator::NotEq => Some("!="),
+        Operator::Lt => Some("<"),
+        Operator::LtEq => Some("<="),
+        Operator::Gt => Some(">"),
+        Operator::GtEq => Some(">="),
+        _ => None,
+    }
+}
+
+/// A scalar column we can filter on: present in the (introspected) schema and not
+/// one of the synthetic columns (`query_vector` is the search input; `score` is output).
+fn is_filter_col(name: &str, schema: &SchemaRef) -> bool {
+    name != "query_vector" && name != "score" && schema.field_with_name(name).is_ok()
+}
+
+/// Translate one predicate into a Milvus boolean-filter fragment, for ANY scalar
+/// column the collection has (comparison / `IN`). Nothing schema-specific is hardcoded.
+fn predicate_milvus(expr: &Expr, schema: &SchemaRef) -> Option<String> {
+    match expr {
+        Expr::BinaryExpr(b) => {
+            let op = milvus_op(b.op)?;
+            if let (Expr::Column(c), Expr::Literal(v, _)) = (b.left.as_ref(), b.right.as_ref()) {
+                if is_filter_col(&c.name, schema) {
+                    return Some(format!("{} {} {}", c.name, op, milvus_value(v)?));
+                }
+            }
+            None
+        }
+        Expr::InList(il) if !il.negated => {
+            if let Expr::Column(c) = il.expr.as_ref() {
+                if is_filter_col(&c.name, schema) {
+                    let mut vals = Vec::with_capacity(il.list.len());
+                    for e in &il.list {
+                        if let Expr::Literal(v, _) = e {
+                            vals.push(milvus_value(v)?);
+                        } else {
+                            return None;
+                        }
+                    }
+                    if !vals.is_empty() {
+                        return Some(format!("{} in [{}]", c.name, vals.join(", ")));
+                    }
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// Build a Milvus boolean filter from all pushable predicates (excludes the
+/// `query_vector` search predicate, which is consumed as the search vector).
+fn extract_milvus_filter(filters: &[Expr], schema: &SchemaRef) -> Option<String> {
+    let parts: Vec<String> = filters.iter().filter_map(|f| predicate_milvus(f, schema)).collect();
     if parts.is_empty() {
         None
     } else {
@@ -133,15 +168,18 @@ fn extract_milvus_filter(filters: &[Expr]) -> Option<String> {
     }
 }
 
-fn is_pushable(expr: &Expr) -> bool {
-    match expr {
-        Expr::BinaryExpr(b) if b.op == Operator::Eq => matches!(
-            b.left.as_ref(),
-            Expr::Column(c) if matches!(c.name.as_str(), "query_vector" | "product_id" | "doc_type")
-        ),
-        Expr::InList(il) => matches!(il.expr.as_ref(), Expr::Column(c) if c.name == "doc_type"),
-        _ => false,
+fn is_pushable(expr: &Expr, schema: &SchemaRef) -> bool {
+    // the query_vector = '[...]' predicate is the search input (consumed in scan)
+    if let Expr::BinaryExpr(b) = expr {
+        if b.op == Operator::Eq {
+            if let Expr::Column(c) = b.left.as_ref() {
+                if c.name == "query_vector" {
+                    return true;
+                }
+            }
+        }
     }
+    predicate_milvus(expr, schema).is_some()
 }
 
 #[async_trait]
@@ -160,7 +198,7 @@ impl TableProvider for MilvusTableProvider {
         Ok(filters
             .iter()
             .map(|f| {
-                if is_pushable(f) {
+                if is_pushable(f, &self.schema) {
                     TableProviderFilterPushDown::Exact
                 } else {
                     TableProviderFilterPushDown::Unsupported
@@ -189,7 +227,7 @@ impl TableProvider for MilvusTableProvider {
                  collection's vector dimension (e.g. '[0.1, 0.2]'): {e}"
             ))
         })?;
-        let filter = extract_milvus_filter(filters);
+        let filter = extract_milvus_filter(filters, &self.schema);
         let top_k = limit.unwrap_or(DEFAULT_TOP_K);
 
         Ok(Arc::new(MilvusExec::new(
@@ -207,7 +245,18 @@ impl TableProvider for MilvusTableProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::prelude::{col, lit};
+
+    // a representative introspected schema (generic columns — nothing hardcoded)
+    fn schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("query_vector", DataType::Utf8, true),
+            Field::new("category", DataType::Utf8, true),
+            Field::new("year", DataType::Int64, true),
+            Field::new("score", DataType::Float32, true),
+        ]))
+    }
 
     #[test]
     fn extracts_query_vector_from_predicate() {
@@ -217,37 +266,47 @@ mod tests {
 
     #[test]
     fn no_query_vector_returns_none() {
-        let filters = vec![col("product_id").eq(lit(3i64))];
+        let filters = vec![col("year").eq(lit(3i64))];
         assert_eq!(extract_query_vector(&filters), None);
     }
 
     #[test]
-    fn builds_milvus_filter_from_eq_predicates() {
+    fn builds_filter_from_eq_predicates_on_any_scalar_column() {
         let filters = vec![
-            col("query_vector").eq(lit("[0.1]")),
-            col("product_id").eq(lit(3i64)),
-            col("doc_type").eq(lit("ticket")),
+            col("query_vector").eq(lit("[0.1]")), // the search vector -- not a filter
+            col("year").eq(lit(3i64)),
+            col("category").eq(lit("news")),
         ];
         assert_eq!(
-            extract_milvus_filter(&filters),
-            Some(r#"product_id == 3 and doc_type == "ticket""#.to_string())
+            extract_milvus_filter(&filters, &schema()),
+            Some(r#"year == 3 and category == "news""#.to_string())
+        );
+    }
+
+    #[test]
+    fn comparison_operators_push_down() {
+        assert_eq!(
+            extract_milvus_filter(&[col("year").gt(lit(2000i64))], &schema()),
+            Some("year > 2000".to_string())
         );
     }
 
     #[test]
     fn builds_in_list_filter() {
-        let filters = vec![col("doc_type").in_list(vec![lit("ticket"), lit("article")], false)];
+        let filters = vec![col("category").in_list(vec![lit("news"), lit("blog")], false)];
         assert_eq!(
-            extract_milvus_filter(&filters),
-            Some(r#"doc_type in ["ticket","article"]"#.to_string())
+            extract_milvus_filter(&filters, &schema()),
+            Some(r#"category in ["news", "blog"]"#.to_string())
         );
     }
 
     #[test]
     fn pushdown_classification() {
-        assert!(is_pushable(&col("query_vector").eq(lit("[0.1]"))));
-        assert!(is_pushable(&col("product_id").eq(lit(3i64))));
-        assert!(is_pushable(&col("doc_type").in_list(vec![lit("ticket")], false)));
-        assert!(!is_pushable(&col("title").eq(lit("x")))); // not a Milvus-pushable column
+        let s = schema();
+        assert!(is_pushable(&col("query_vector").eq(lit("[0.1]")), &s));
+        assert!(is_pushable(&col("year").eq(lit(3i64)), &s)); // any scalar column
+        assert!(is_pushable(&col("category").in_list(vec![lit("news")], false), &s));
+        assert!(!is_pushable(&col("missing").eq(lit("x")), &s)); // not in the schema
+        assert!(!is_pushable(&col("score").eq(lit(1.0f32)), &s)); // synthetic column
     }
 }
