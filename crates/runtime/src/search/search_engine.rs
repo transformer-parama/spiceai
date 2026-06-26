@@ -35,6 +35,8 @@ const EMBED_UDF_NAME: &str = "embed";
 use runtime_request_context::{AsyncMarker, CacheControl, CacheKeyType, RequestContext};
 #[cfg(feature = "duckdb")]
 use search::index::duckdb::DuckDBVectorIndex;
+#[cfg(feature = "milvus_vectors")]
+use search::index::milvus::MilvusVector;
 #[cfg(feature = "s3_vectors")]
 use search::index::s3_vectors::S3Vector;
 use search::pipeline::QueryEngine;
@@ -117,6 +119,15 @@ impl SearchEngine {
 
         #[cfg(feature = "duckdb")]
         if let Some((indexes, _)) = find_index_in_table_provider::<DuckDBVectorIndex>(tbl)
+            && let Some(index) = indexes
+                .into_iter()
+                .find(|idx| idx.search_column() == embedding_column)
+        {
+            return Some(Arc::new(index.clone()) as Arc<dyn SearchIndex>);
+        }
+
+        #[cfg(feature = "milvus_vectors")]
+        if let Some((indexes, _)) = find_index_in_table_provider::<MilvusVector>(tbl)
             && let Some(index) = indexes
                 .into_iter()
                 .find(|idx| idx.search_column() == embedding_column)

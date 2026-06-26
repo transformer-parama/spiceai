@@ -273,6 +273,14 @@ pub async fn embedding_columns_from_table(
         }
     }
 
+    #[cfg(feature = "milvus_vectors")]
+    {
+        use search::index::milvus::MilvusVector;
+        if let Some((indexes, _)) = find_index_in_table_provider::<MilvusVector>(&table_provider) {
+            embedding_columns.extend(indexes.iter().map(|i| i.search_column()));
+        }
+    }
+
     Some(embedding_columns.into_iter().collect())
 }
 
