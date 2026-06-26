@@ -77,10 +77,14 @@ pub fn create_prompt(query: &str, ctx: &QueryGenerationContext) -> String {
     }
 
     if !ctx.semantic_search_tables.is_empty() {
+        let tables = ctx.semantic_search_tables.join(", ");
+        let example = ctx
+            .semantic_search_tables
+            .first()
+            .map_or("my_table", String::as_str);
         let _ = write!(
             prompt,
-            "\n\nSemantic search: these tables support vector similarity search over text: {}. For a question that asks for text semantically similar to / about / relevant to a topic, do NOT use LIKE and do NOT invent functions; instead use the table function `vector_search`: SELECT _score, <columns> FROM vector_search(<table>, '<the search phrase>', <k>). It returns a `_score` column (higher = more relevant) plus the table's columns.",
-            ctx.semantic_search_tables.join(", ")
+            "\n\nSemantic search: these tables support vector similarity search over text: {tables}. For a question asking for text semantically similar to / about / relevant to a topic, do NOT use LIKE and do NOT invent functions (no SIMILARITY()); use the table function `vector_search`. CRITICAL RULES: (1) its FIRST argument is the table name written as a BARE, UNQUOTED identifier — never a quoted string. (2) Use LIMIT for top-k, never TOP. Example: SELECT _score, text FROM vector_search({example}, 'the search phrase', 5) ORDER BY _score DESC LIMIT 5. It returns a `_score` column (higher = more relevant) plus the table's columns."
         );
     }
 
