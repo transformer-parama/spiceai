@@ -91,6 +91,7 @@ runtime-rate-control = { path = "../runtime-rate-control" }
 runtime-request-context = { path = "../runtime-request-context" }
 rusqlite = { workspace = true, optional = true }
 elasticsearch = { path = "../elasticsearch", optional = true }
+milvus-client = { path = "../milvus-client", optional = true }
 s3_vectors = { path = "../s3_vectors", optional = true }
 s3_vectors_metadata_filter = { path = "../s3_vectors_metadata_filter", optional = true }
 scylla = { workspace = true, optional = true }
@@ -172,6 +173,7 @@ postgres = [
     "datafusion-table-providers/postgres",
     "datafusion-table-providers/postgres-federation",
 ]
+milvus_vectors = ["dep:milvus-client"]
 s3_vectors = ["dep:s3_vectors", "dep:s3_vectors_metadata_filter"]
 scylladb = ["dep:scylla", "datafusion-table-providers/federation"]
 sharepoint = ["dep:graph-rs-sdk"]

@@ -5431,6 +5431,7 @@ dependencies = [
  "insta",
  "logos",
  "mailparse",
+ "milvus-client",
  "mongodb",
  "mysql_async",
  "native-tls",

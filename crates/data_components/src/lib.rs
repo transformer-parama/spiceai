@@ -111,6 +111,8 @@ pub mod postgres_replication;
 pub mod refresh_skip;
 pub mod resilient_http;
 pub mod s3_single_file_cached;
+#[cfg(feature = "milvus_vectors")]
+pub mod milvus;
 #[cfg(feature = "s3_vectors")]
 pub mod s3_vectors;
 pub mod schema_discovery;
