@@ -16008,6 +16008,7 @@ dependencies = [
  "llms",
  "logos",
  "mediatype",
+ "milvus-client",
  "model_components",
  "moka",
  "mongodb",

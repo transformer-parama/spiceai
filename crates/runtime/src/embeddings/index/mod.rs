@@ -18,6 +18,8 @@ limitations under the License.
 pub mod duckdb;
 #[cfg(feature = "elasticsearch")]
 pub mod elasticsearch;
+#[cfg(feature = "milvus_vectors")]
+pub mod milvus;
 #[cfg(feature = "s3_vectors")]
 pub mod s3;
 pub mod table;

@@ -53,7 +53,7 @@ use datafusion_expr::{
     LogicalPlanBuilder, ScalarFunctionArgs, ScalarUDFImpl, TableProviderFilterPushDown,
     binary_expr, ident,
 };
-#[cfg(any(feature = "s3_vectors", feature = "elasticsearch", feature = "duckdb"))]
+#[cfg(any(feature = "s3_vectors", feature = "elasticsearch", feature = "duckdb", feature = "milvus_vectors"))]
 use futures::FutureExt;
 use itertools::Itertools;
 #[cfg(feature = "models")]
@@ -84,7 +84,7 @@ use crate::{
 };
 use runtime_request_context::{AsyncMarker, RequestContext};
 
-#[cfg(any(feature = "s3_vectors", feature = "elasticsearch", feature = "duckdb"))]
+#[cfg(any(feature = "s3_vectors", feature = "elasticsearch", feature = "duckdb", feature = "milvus_vectors"))]
 use {
     crate::search::util::find_index_in_table_provider,
     search::index::SearchIndex,
@@ -97,7 +97,10 @@ use crate::accelerated_table::AcceleratedTable;
 #[cfg(feature = "s3_vectors")]
 use search::index::s3_vectors::S3Vector;
 
-#[cfg(any(feature = "s3_vectors", feature = "elasticsearch", feature = "duckdb"))]
+#[cfg(feature = "milvus_vectors")]
+use search::index::milvus::MilvusVector;
+
+#[cfg(any(feature = "s3_vectors", feature = "elasticsearch", feature = "duckdb", feature = "milvus_vectors"))]
 use search::index::chunking::ChunkedSearchIndex;
 
 #[cfg(feature = "elasticsearch")]
@@ -503,7 +506,7 @@ impl VectorSearchTableFunc {
         })
     }
 
-    #[cfg(any(feature = "s3_vectors", feature = "elasticsearch", feature = "duckdb"))]
+    #[cfg(any(feature = "s3_vectors", feature = "elasticsearch", feature = "duckdb", feature = "milvus_vectors"))]
     fn index_based_vector_table(
         tbl: &Arc<dyn TableProvider>,
         args: &VectorSearchTableFuncArgs,
@@ -540,6 +543,17 @@ impl VectorSearchTableFunc {
             {
                 vector_indexes.extend(
                     duckdb_indexes
+                        .into_iter()
+                        .map(|c| Arc::new(c.clone()) as Arc<dyn SearchIndex>),
+                );
+            }
+        }
+
+        #[cfg(feature = "milvus_vectors")]
+        {
+            if let Some((milvus_indexes, _)) = find_index_in_table_provider::<MilvusVector>(tbl) {
+                vector_indexes.extend(
+                    milvus_indexes
                         .into_iter()
                         .map(|c| Arc::new(c.clone()) as Arc<dyn SearchIndex>),
                 );
@@ -671,7 +685,7 @@ impl TableFunctionImpl for VectorSearchTableFunc {
         };
 
         // For table with a vector engine, use it.
-        #[cfg(any(feature = "s3_vectors", feature = "elasticsearch", feature = "duckdb"))]
+        #[cfg(any(feature = "s3_vectors", feature = "elasticsearch", feature = "duckdb", feature = "milvus_vectors"))]
         if let Some(table_provider) = Self::index_based_vector_table(&table_provider, &args)? {
             return Ok(table_provider);
         }

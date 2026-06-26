@@ -153,6 +153,7 @@ rustls.workspace = true
 rustls-pemfile.workspace = true
 elasticsearch = { path = "../elasticsearch", optional = true }
 duration-parse = { workspace = true, optional = true }
+milvus-client = { path = "../milvus-client", optional = true }
 s3_vectors = { path = "../s3_vectors", optional = true }
 scheduler = { path = "../scheduler" }
 schemars.workspace = true
@@ -347,6 +348,11 @@ postgres = [
 ]
 postgres-accel = ["postgres", "dep:tokio-postgres"]
 
+milvus_vectors = [
+    "data_components/milvus_vectors",
+    "dep:milvus-client",
+    "search/milvus_vectors",
+]
 s3_vectors = [
     "data_components/s3_vectors",
     "dep:s3_vectors",

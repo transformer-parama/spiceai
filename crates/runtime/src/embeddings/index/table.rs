@@ -123,6 +123,18 @@ pub async fn wrap_table_as_index(
             )
             .await
         }
+        #[cfg(feature = "milvus_vectors")]
+        Some("milvus") => {
+            wrap_table_as_index_milvus(
+                embedding_models,
+                secrets,
+                tbl,
+                columns,
+                inner_table_provider,
+                vector_store,
+            )
+            .await
+        }
         None => Err(Box::from(
             "No vector engine specified. Provide a vector engine under `.vectors.engine`."
                 .to_string(),
@@ -176,6 +188,62 @@ async fn wrap_table_as_index_duckdb(
         start.elapsed()
     );
     Ok(provider)
+}
+
+#[cfg(feature = "milvus_vectors")]
+async fn wrap_table_as_index_milvus(
+    embedding_models: &Arc<RwLock<EmbeddingModelStore>>,
+    secrets: &Arc<RwLock<Secrets>>,
+    tbl: &TableReference,
+    columns: &[Column],
+    inner_table_provider: Arc<dyn TableProvider + 'static>,
+    vector_store: &VectorStore,
+) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
+    // Imported locally because the top-level imports are gated on
+    // s3_vectors/elasticsearch, which may be off when only milvus_vectors is on.
+    use runtime_datafusion_index::{Index, IndexedTableProvider};
+    use search::generation::util::get_primary_keys;
+    use snafu::ResultExt;
+
+    tracing::info!("Milvus vector engine for table {tbl} initializing...");
+    let start = std::time::Instant::now();
+
+    let embedding_columns: Vec<_> = columns
+        .iter()
+        .filter_map(|c| c.embeddings.first().map(|embed| (c.name.clone(), embed.clone())))
+        .collect();
+
+    let inner_schema = inner_table_provider.schema();
+    let mut provider = if let Some(indexed) = inner_table_provider
+        .as_any()
+        .downcast_ref::<IndexedTableProvider>()
+    {
+        indexed.clone()
+    } else {
+        IndexedTableProvider::new(Arc::clone(&inner_table_provider))
+    };
+
+    for (column, config) in embedding_columns {
+        let vector_index = super::milvus::try_from_table(
+            tbl,
+            column,
+            config,
+            vector_store,
+            // Primary key: spicepod override, fallback to the base table's PK.
+            get_primary_keys(&inner_table_provider).boxed()?,
+            Arc::clone(&inner_schema),
+            Arc::clone(embedding_models),
+            Arc::clone(secrets),
+        )
+        .await?;
+        provider = provider.add_index(Arc::new(vector_index) as Arc<dyn Index>);
+    }
+
+    tracing::info!(
+        "Milvus vector engine for table {tbl} initialized in {:?}",
+        start.elapsed()
+    );
+    Ok(Arc::new(provider))
 }
 
 #[cfg(feature = "s3_vectors")]
