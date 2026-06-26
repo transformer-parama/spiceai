@@ -25,6 +25,7 @@ members = [
     "crates/google-genai",
     "crates/hash-index",
     "crates/llms",
+    "crates/milvus-client",
     "crates/model_components",
     "crates/ns_lookup",
     "crates/object_store_occ",

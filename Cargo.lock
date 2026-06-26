@@ -4117,6 +4117,7 @@ dependencies = [
  "async-trait",
  "datafusion",
  "futures",
+ "milvus-client",
  "opentelemetry",
  "rand 0.10.1",
  "reqwest 0.12.24",
@@ -11472,6 +11473,23 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.114",
+]
+
+[[package]]
+name = "milvus-client"
+version = "2.0.1"
+dependencies = [
+ "datafusion",
+ "futures",
+ "opentelemetry",
+ "rand 0.10.1",
+ "reqwest 0.12.24",
+ "serde",
+ "serde_json",
+ "snafu",
+ "tokio",
+ "tracing",
+ "wiremock",
 ]
 
 [[package]]

@@ -25,8 +25,6 @@ limitations under the License.
 //! and transient-failure retries) is built once and shared across all datasets
 //! and queries served by this connector.
 
-mod exec;
-mod milvus;
 mod table_provider;
 
 use std::any::Any;
@@ -46,9 +44,9 @@ use runtime::dataconnector::{
 use runtime::parameters::ParameterSpec;
 use secrecy::ExposeSecret;
 
-use crate::exec::arrow_type_for;
+use milvus_client::arrow_type_for;
+use milvus_client::{ConnectionConfig, MilvusCollection, MilvusConnection};
 
-use crate::milvus::{ConnectionConfig, MilvusCollection, MilvusConnection};
 use crate::table_provider::MilvusTableProvider;
 
 /// Milvus data connector. Holds a shared pooled connection plus the collection

@@ -41,8 +41,8 @@ use datafusion::datasource::{TableProvider, TableType};
 use datafusion::logical_expr::{Expr, Operator, TableProviderFilterPushDown};
 use datafusion::physical_plan::ExecutionPlan;
 
-use crate::exec::MilvusExec;
-use crate::milvus::{MilvusCollection, MilvusConnection};
+use milvus_client::MilvusExec;
+use milvus_client::{MilvusCollection, MilvusConnection};
 
 const DEFAULT_TOP_K: usize = 50;
 

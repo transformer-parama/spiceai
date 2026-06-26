@@ -1,21 +1,17 @@
 [package]
-name = "connector-milvus"
+name = "milvus-client"
 edition.workspace = true
 version.workspace = true
 rust-version.workspace = true
 license-file.workspace = true
-description = "Milvus vector-search data connector for Spice.ai runtime"
+description = "Low-level async Milvus v2 REST client + Arrow execution, shared by the Milvus data connector and the Milvus vector index (no `runtime` dependency, to avoid a cycle)"
 
 [dependencies]
-async-trait.workspace = true
 datafusion.workspace = true
 futures.workspace = true
-milvus-client = { path = "../../milvus-client" }
 opentelemetry.workspace = true
 reqwest.workspace = true
 rand.workspace = true
-runtime = { path = "../../runtime" }
-secrecy.workspace = true
 snafu.workspace = true
 serde = { workspace = true }
 serde_json.workspace = true
@@ -25,6 +21,3 @@ tracing.workspace = true
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 wiremock = "0.6"
-
-[features]
-default = []
