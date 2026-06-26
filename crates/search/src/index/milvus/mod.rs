@@ -28,7 +28,7 @@ use std::any::Any;
 use std::sync::Arc;
 
 use arrow::array::RecordBatch;
-use arrow_schema::Field;
+use arrow_schema::{DataType, Field};
 use async_trait::async_trait;
 use data_components::milvus::{
     CachedQueryVector, ComputeQueryVector, MilvusQueryTable, MilvusVectorsTable,
@@ -37,7 +37,7 @@ use datafusion::catalog::TableProvider;
 use datafusion::datasource::DefaultTableSource;
 use datafusion::error::DataFusionError;
 use datafusion::logical_expr::LogicalPlan;
-use datafusion_expr::{LogicalPlanBuilder, col};
+use datafusion_expr::{LogicalPlanBuilder, cast, col};
 use llms::embeddings::Embed;
 use runtime_datafusion_index::Index;
 
@@ -150,7 +150,9 @@ impl SearchIndex for MilvusVector {
         // layer's internal score name. The SearchQueryProvider joins these back
         // to the base table on the primary key to materialize the row data.
         let mut projection: Vec<_> = self.primary_key.iter().map(|f| col(f.name())).collect();
-        projection.push(col(MILVUS_SCORE_NAME).alias(SEARCH_SCORE_COLUMN_NAME));
+        // /v1/search aggregation requires the score column to be Float64; the
+        // Milvus exec produces Float32, so cast it here.
+        projection.push(cast(col(MILVUS_SCORE_NAME), DataType::Float64).alias(SEARCH_SCORE_COLUMN_NAME));
 
         Ok(LogicalPlanBuilder::scan(
             "tbl",
