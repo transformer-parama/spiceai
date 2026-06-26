@@ -423,6 +423,13 @@ pub(crate) async fn handle_nsql_query(
     let sql_gen = nql_model.as_sql().unwrap_or(&default_sql_generation);
     // Tracks previously generated queries and associated errors to enable an efficient retry mechanism
     let mut sql_gen_ctx = QueryGenerationContext::default();
+    // Tell the model which tables support vector_search (semantic search), so it
+    // can answer semantic-similarity questions with vector_search(...) instead of
+    // LIKE / invented functions.
+    sql_gen_ctx.semantic_search_tables = crate::search::util::user_tables_that_can_search(&df)
+        .await
+        .map(|tbls| tbls.iter().map(std::string::ToString::to_string).collect())
+        .unwrap_or_default();
     let mut num_retries = 0;
 
     loop {

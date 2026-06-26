@@ -25,6 +25,10 @@ pub(crate) mod structured_output;
 #[derive(Default)]
 pub struct QueryGenerationContext {
     pub failed_attempts: Vec<FailedAttempt>,
+    /// Tables that have a vector/semantic search index. When non-empty, the
+    /// prompt tells the model it may use `vector_search(<table>, '<text>', <k>)`
+    /// for semantic-similarity questions instead of `LIKE`.
+    pub semantic_search_tables: Vec<String>,
 }
 
 pub struct FailedAttempt {
@@ -70,6 +74,14 @@ pub fn create_prompt(query: &str, ctx: &QueryGenerationContext) -> String {
             failed_attempts_formatted(&ctx.failed_attempts)
         );
         prompt.push_str(&failed_atttempts_str);
+    }
+
+    if !ctx.semantic_search_tables.is_empty() {
+        let _ = write!(
+            prompt,
+            "\n\nSemantic search: these tables support vector similarity search over text: {}. For a question that asks for text semantically similar to / about / relevant to a topic, do NOT use LIKE and do NOT invent functions; instead use the table function `vector_search`: SELECT _score, <columns> FROM vector_search(<table>, '<the search phrase>', <k>). It returns a `_score` column (higher = more relevant) plus the table's columns.",
+            ctx.semantic_search_tables.join(", ")
+        );
     }
 
     prompt
