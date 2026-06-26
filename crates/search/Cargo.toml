@@ -42,6 +42,7 @@ default = ["text_search", "s3_vectors"]
 duckdb = ["datafusion-table-providers/duckdb", "dep:datafusion-table-providers", "dep:duckdb", "llms"]
 elasticsearch = ["data_components/elasticsearch", "dep:elasticsearch", "llms"]
 llms = ["dep:llms"]
+milvus_vectors = ["data_components/milvus_vectors", "llms"]
 s3_vectors = ["data_components/s3_vectors", "llms"]
 text_search = ["dep:tantivy"]
 

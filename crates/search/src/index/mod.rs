@@ -27,6 +27,8 @@ pub mod chunking;
 pub mod duckdb;
 #[cfg(feature = "elasticsearch")]
 pub mod elasticsearch;
+#[cfg(feature = "milvus_vectors")]
+pub mod milvus;
 pub mod native_vector;
 #[cfg(feature = "s3_vectors")]
 pub mod s3_vectors;
