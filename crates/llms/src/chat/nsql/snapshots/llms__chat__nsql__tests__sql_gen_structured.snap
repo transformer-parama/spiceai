@@ -6,7 +6,7 @@ expression: req_str
   "messages": [
     {
       "role": "system",
-      "content": "Task: Write a SQL query to answer this question: _\\\"SELECT * FROM table\\\"_. Instruction: Return only valid SQL code, nothing additional, don't wrap it in ```. Columns with capitals must be quoted. For tables with schemas and catalogs '\"catalog\".\"schema\".\"table\"' not '\"catalog.schema.table\"'."
+      "content": "Task: Write a SQL query to answer this question: _\\\"SELECT * FROM table\\\"_. Instruction: Return only valid SQL code, nothing additional, don't wrap it in ```. Columns with capitals must be quoted. Write each table name exactly as shown and UNQUOTED, including any schema/catalog prefix, e.g. spice.public.my_table. NEVER wrap a qualified (dotted) table name in a single pair of quotes: \"spice.public.my_table\" is WRONG and will not be found (it is read as one literal name). Only if a name part has capitals or special characters, quote each part separately (\"spice\".\"public\".\"My_Table\"), never the whole dotted string."
     }
   ],
   "model": "model_id",
@@ -16,8 +16,7 @@ expression: req_str
       "name": "sql_mode",
       "schema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "title": "StructuredNsqlOutput",
-        "type": "object",
+        "additionalProperties": false,
         "properties": {
           "sql": {
             "type": "string"
@@ -26,7 +25,8 @@ expression: req_str
         "required": [
           "sql"
         ],
-        "additionalProperties": false
+        "title": "StructuredNsqlOutput",
+        "type": "object"
       },
       "strict": true
     }
