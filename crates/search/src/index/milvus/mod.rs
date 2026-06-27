@@ -185,3 +185,113 @@ impl VectorIndex for MilvusVector {
         vec![]
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use arrow::datatypes::{Schema, SchemaRef};
+    use arrow_schema::{DataType, Field};
+    use async_trait::async_trait;
+    use data_components::milvus::MilvusVectorsTable;
+    use llms::embeddings::{Embed, EmbeddingInput};
+    use milvus_client::{ConnectionConfig, MilvusCollection, MilvusConnection};
+
+    use super::MilvusVector;
+    use crate::SEARCH_SCORE_COLUMN_NAME;
+    use crate::index::SearchIndex;
+
+    /// A no-op embedder: `query_table_provider` only *builds* the plan (the
+    /// embedding runs later, at scan time), so this is never actually invoked —
+    /// it just satisfies the `Arc<dyn Embed>` the index holds.
+    #[derive(Debug)]
+    struct StubEmbed {
+        dim: i32,
+    }
+
+    #[async_trait]
+    impl Embed for StubEmbed {
+        async fn embed(
+            &self,
+            _input: EmbeddingInput,
+        ) -> llms::embeddings::Result<Vec<Vec<f32>>> {
+            Ok(vec![vec![0.0_f32; usize::try_from(self.dim).unwrap_or(0)]])
+        }
+
+        fn size(&self) -> i32 {
+            self.dim
+        }
+    }
+
+    fn stub_milvus_vector() -> MilvusVector {
+        // The search output schema the connector would produce: the primary key,
+        // a metadata column, and the synthetic Float32 `score` column.
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("source_id", DataType::Int64, false),
+            Field::new("text", DataType::Utf8, true),
+            Field::new("score", DataType::Float32, false),
+        ]));
+        let conn = Arc::new(
+            MilvusConnection::new(ConnectionConfig {
+                host: "localhost".to_string(),
+                port: 19530,
+                secure: false,
+                token: None,
+                timeout: Duration::from_secs(5),
+                connect_timeout: Duration::from_secs(2),
+                max_retries: 0,
+                tls_skip_verify: false,
+                tls_ca_cert_path: None,
+            })
+            .expect("build milvus connection"),
+        );
+        let coll = MilvusCollection {
+            collection: "documents".to_string(),
+            vector_field: "embedding".to_string(),
+            metric: "COSINE".to_string(),
+            output_fields: vec!["source_id".to_string(), "text".to_string()],
+        };
+        let table = MilvusVectorsTable::new(conn, coll, schema, 8);
+
+        MilvusVector::new(
+            table,
+            "text".to_string(),
+            vec![Field::new("source_id", DataType::Int64, false)],
+            Arc::new(StubEmbed { dim: 8 }),
+            8,
+        )
+    }
+
+    /// The contract `/v1/search` aggregation relies on: the index's logical plan
+    /// projects the primary key(s) plus a `_score` column, and `_score` is
+    /// Float64 (the Milvus exec emits Float32, so it must be cast).
+    #[test]
+    fn query_table_provider_projects_primary_key_and_float64_score() {
+        let mv = stub_milvus_vector();
+        let plan = mv
+            .query_table_provider("reduce patient wait times")
+            .expect("build query_table_provider plan");
+
+        let fields = plan.schema().fields();
+        let names: Vec<&str> = fields.iter().map(|f| f.name().as_str()).collect();
+        assert_eq!(names, vec!["source_id", SEARCH_SCORE_COLUMN_NAME]);
+
+        let score = fields
+            .iter()
+            .find(|f| f.name() == SEARCH_SCORE_COLUMN_NAME)
+            .expect("plan has a _score column");
+        assert_eq!(
+            score.data_type(),
+            &DataType::Float64,
+            "_score must be Float64 for /v1/search aggregation"
+        );
+    }
+
+    /// The vector index advertises its embedding dimension to the search layer.
+    #[test]
+    fn dimension_is_reported() {
+        use crate::index::VectorIndex;
+        assert_eq!(stub_milvus_vector().dimension(), 8);
+    }
+}

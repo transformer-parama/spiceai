@@ -48,4 +48,5 @@ text_search = ["dep:tantivy"]
 
 [dev-dependencies]
 insta = { workspace = true, features = ["json"] }
+milvus-client = { path = "../milvus-client" }   # for the MilvusVector index unit test
 tokio.workspace = true

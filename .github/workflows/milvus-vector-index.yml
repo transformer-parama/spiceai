@@ -1,0 +1,73 @@
+# CI for the Milvus VectorIndex + NL->federated-search work (the
+# `milvus-vector-index` branch) and the Neo4j connector.
+#
+# Covers the code the existing connector-milvus.yml does NOT:
+#   * milvus-client      — the shared low-level client (wiremock unit tests)
+#   * data_components/search MilvusVector — the engine-side VectorIndex
+#     (query_table_provider projects the primary key + a Float64 `_score`)
+#   * llms nsql create_prompt — the `vector_search` instruction injected into
+#     the NL->SQL prompt when a dataset has a vector index
+#   * connector-neo4j    — the graph connector (no other workflow runs it)
+#
+# Unit tests only (no network). Cargo caching keeps reruns fast; the first run
+# compiles each crate's dependency closure once.
+name: milvus-vector-index
+
+on:
+  push:
+    paths:
+      - "crates/milvus-client/**"
+      - "crates/data_components/src/milvus/**"
+      - "crates/search/src/index/milvus/**"
+      - "crates/llms/src/chat/nsql/**"
+      - "crates/data-connectors/connector-neo4j/**"
+      - ".github/workflows/milvus-vector-index.yml"
+  pull_request:
+    paths:
+      - "crates/milvus-client/**"
+      - "crates/data_components/src/milvus/**"
+      - "crates/search/src/index/milvus/**"
+      - "crates/llms/src/chat/nsql/**"
+      - "crates/data-connectors/connector-neo4j/**"
+  workflow_dispatch:
+
+jobs:
+  # Light crates: the shared client and the graph connector.
+  client-and-neo4j:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: milvus-client unit tests
+        run: cargo test -p milvus-client
+      - name: connector-neo4j unit tests
+        run: cargo test -p connector-neo4j
+
+  # The NL->SQL prompt injection (lives in the llms crate).
+  nsql-prompt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: create_prompt vector_search injection tests
+        # --no-default-features skips the heavy local_llm/local_embed (mistralrs/
+        # candle) build; the nsql snapshots are recorded under this same set.
+        run: cargo test -p llms --no-default-features --lib chat::nsql
+
+  # The engine-side Milvus VectorIndex (gated behind the milvus_vectors feature).
+  vector-index:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: MilvusVector index tests (query_table_provider -> pk + Float64 _score)
+        run: cargo test -p search --features milvus_vectors index::milvus
