@@ -54,22 +54,107 @@ use itertools::Itertools;
 use llms::chat::nsql::{FailedAttempt, QueryGenerationContext, default::DefaultSqlGeneration};
 use serde::{Deserialize, Serialize};
 use spicepod::component::model::ModelType;
-use std::{sync::Arc, time::Duration};
-use tokio::sync::RwLock;
+use std::{
+    sync::{Arc, LazyLock},
+    time::Duration,
+};
+use tokio::sync::{RwLock, Semaphore};
 use tracing::Span;
 use tracing_futures::Instrument;
 
 use super::accept_header_types;
 use crate::datafusion::query::QueryBuilder;
 
-// Default number of retries for NSQL queries if the generated query fails to execute
-const DEFAULT_NSQL_RETRIES: u8 = 10;
+// Default number of retries for NSQL queries if the generated query fails to execute.
+// Each retry re-invokes the model AND re-executes the (possibly heavy, federated)
+// query, so a high cap turns a single slow/mis-generated request into a model +
+// compute storm under sustained load. Override with `SPICE_NSQL_MAX_RETRIES`.
+const DEFAULT_NSQL_RETRIES: u8 = 3;
+
+// Default wall-clock budget for an entire NSQL request (all retries combined). When
+// exceeded, the request's cancellation token is tripped so the in-flight model call
+// AND query execution stop, rather than running until a far-off client/proxy timeout
+// while pinning runtime worker threads. Override with `SPICE_NSQL_BUDGET_SECS`.
+const DEFAULT_NSQL_BUDGET_SECS: u64 = 45;
 
 // Maximum number of concurrent sampling tools executions for NSQL
 const DATA_SAMPLING_MAX_CONCURRENT: usize = 10;
 
 // NSQL streaming keep alive interval in seconds
 const NSQL_STREAM_KEEP_ALIVE: u64 = 30;
+
+/// Max retries before NSQL gives up, from `SPICE_NSQL_MAX_RETRIES` or the default.
+fn nsql_max_retries() -> u8 {
+    std::env::var("SPICE_NSQL_MAX_RETRIES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_NSQL_RETRIES)
+}
+
+/// Per-request wall-clock budget, from `SPICE_NSQL_BUDGET_SECS` or the default.
+fn nsql_budget() -> Duration {
+    let secs = std::env::var("SPICE_NSQL_BUDGET_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&s| s > 0)
+        .unwrap_or(DEFAULT_NSQL_BUDGET_SECS);
+    Duration::from_secs(secs)
+}
+
+/// Admission control for the NSQL path. Each NSQL request is heavy server-side
+/// (schema + data sampling across every dataset, model generation, then federated
+/// execution — times the retry count). Without a bound, a burst of NL requests —
+/// including ones whose clients have already timed out but whose server-side work
+/// keeps running — saturates the runtime worker threads and stalls *all* query
+/// execution (even trivial `SELECT 1`). This semaphore caps how many NSQL requests
+/// execute concurrently so overload degrades gracefully (requests queue) instead of
+/// wedging the engine. Override with `SPICE_NSQL_MAX_CONCURRENT`.
+static NSQL_CONCURRENCY: LazyLock<Semaphore> = LazyLock::new(|| {
+    let limit = std::env::var("SPICE_NSQL_MAX_CONCURRENT")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or_else(|| {
+            // Each NSQL request can consume several cores (data sampling fanned out
+            // across every dataset + federated/semantic execution), so allow at most
+            // ~half the cores to run NSQL concurrently. This keeps headroom for the
+            // data plane and stops a small box from saturating under NL load.
+            let cores = std::thread::available_parallelism()
+                .map(std::num::NonZeroUsize::get)
+                .unwrap_or(4);
+            std::cmp::max(2, cores / 2)
+        });
+    Semaphore::new(limit)
+});
+
+/// Aborts a spawned task when dropped, so the per-request budget timer never
+/// outlives the request it guards.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Status + message for an NSQL request whose cancellation token fired: a
+/// `504` when the per-request budget elapsed, otherwise a `499` (client/admin
+/// cancel). Distinguished by whether the deadline has passed.
+fn nsql_cancel_outcome(deadline: tokio::time::Instant, budget: Duration) -> (StatusCode, String) {
+    if tokio::time::Instant::now() >= deadline {
+        (
+            StatusCode::GATEWAY_TIMEOUT,
+            format!(
+                "NSQL request exceeded its {}s time budget (SPICE_NSQL_BUDGET_SECS)",
+                budget.as_secs()
+            ),
+        )
+    } else {
+        (
+            StatusCode::from_u16(499).unwrap_or(StatusCode::REQUEST_TIMEOUT),
+            "NSQL request cancelled".to_string(),
+        )
+    }
+}
 
 fn clean_model_based_sql(input: &str) -> String {
     let no_dashes = match input.strip_prefix("--") {
@@ -354,6 +439,26 @@ pub(crate) async fn handle_nsql_query(
 
     crate::model::add_tools_used(&context, 1);
 
+    // Admission control: bound concurrent NSQL executions so a burst (or a pile of
+    // client-abandoned-but-still-running requests) can't saturate the runtime worker
+    // threads and stall all query execution. Held (RAII) for the whole request,
+    // covering the heavy schema/sampling/model/execution work below.
+    let _nsql_permit = NSQL_CONCURRENCY.acquire().await.ok();
+
+    // Per-request wall-clock budget. A background timer trips the NSQL cancellation
+    // token when the budget elapses; via the existing cooperative-cancellation
+    // plumbing this stops the in-flight model call AND query execution, so a slow or
+    // retrying request fails fast instead of pinning workers until a client timeout.
+    let budget = nsql_budget();
+    let deadline = tokio::time::Instant::now() + budget;
+    let _nsql_budget_timer = {
+        let token = nsql_token.clone();
+        AbortOnDrop(tokio::spawn(async move {
+            tokio::time::sleep_until(deadline).await;
+            token.cancel();
+        }))
+    };
+
     let span = tracing::span!(target: "task_history", tracing::Level::INFO, "nsql", input = %query, model = %model, "labels");
 
     if let Some(traceparent) = context.trace_parent() {
@@ -430,19 +535,17 @@ pub(crate) async fn handle_nsql_query(
         .await
         .map(|tbls| tbls.iter().map(std::string::ToString::to_string).collect())
         .unwrap_or_default();
+    let max_retries = nsql_max_retries();
     let mut num_retries = 0;
 
     loop {
         // Cooperative cancellation: bail out between LLM/query iterations if
         // the NSQL token was cancelled (request token cancel propagates to
-        // this child, and admin cancel via the inner query id cancels this
-        // token directly).
+        // this child, admin cancel via the inner query id cancels this token
+        // directly, and the per-request budget timer cancels it on timeout).
         if nsql_token.is_cancelled() {
-            return (
-                StatusCode::from_u16(499).unwrap_or(StatusCode::REQUEST_TIMEOUT),
-                headers,
-                "NSQL request cancelled".to_string(),
-            );
+            let (code, msg) = nsql_cancel_outcome(deadline, budget);
+            return (code, headers, msg);
         }
 
         let Ok(mut req) = sql_gen.create_request_for_query(&model, &query, &sql_gen_ctx) else {
@@ -467,11 +570,8 @@ pub(crate) async fn handle_nsql_query(
         let resp = tokio::select! {
             biased;
             () = nsql_token.cancelled() => {
-                return (
-                    StatusCode::from_u16(499).unwrap_or(StatusCode::REQUEST_TIMEOUT),
-                    headers,
-                    "NSQL request cancelled".to_string(),
-                );
+                let (code, msg) = nsql_cancel_outcome(deadline, budget);
+                return (code, headers, msg);
             }
             res = chat_fut => match res {
                 Ok(r) => r,
@@ -522,7 +622,7 @@ pub(crate) async fn handle_nsql_query(
                             .await;
                         }
                         Err(e) => {
-                            if num_retries >= DEFAULT_NSQL_RETRIES {
+                            if num_retries >= max_retries {
                                 tracing::error!("Error collecting query results: {e}");
                                 return (StatusCode::BAD_REQUEST, headers, e.to_string());
                             }
@@ -538,7 +638,7 @@ pub(crate) async fn handle_nsql_query(
                     Err(e) => {
                         // If query failed, retry with the updated context
 
-                        if num_retries >= DEFAULT_NSQL_RETRIES {
+                        if num_retries >= max_retries {
                             tracing::error!("Error executing query: {e}");
                             return (StatusCode::BAD_REQUEST, headers, e.to_string());
                         }
