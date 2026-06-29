@@ -217,6 +217,110 @@ async fn sample_messages(
     Ok(tool_call_messages.into_iter().flatten().collect())
 }
 
+// Default TTL for the NSQL schema/sample message cache. The schema (`table_schema`)
+// and data-sample (`DistinctColumns` + `RandomSample`) tool-use message blocks are a
+// pure function of the resolved table set, but were previously rebuilt on EVERY
+// request — re-running ~1 `SELECT DISTINCT` per column per table (~100 federated
+// queries for a wide pod) against the live stores each time. That per-request fan-out
+// is what saturates the backing stores (Neo4j, Iceberg catalog) under concurrent NL
+// load. Override with `SPICE_NSQL_SAMPLE_CACHE_TTL_SECS`; `0` disables the cache.
+const DEFAULT_NSQL_SAMPLE_CACHE_TTL_SECS: u64 = 3600;
+
+/// TTL for the schema/sample message cache, from `SPICE_NSQL_SAMPLE_CACHE_TTL_SECS`
+/// or the default. A value of `0` disables caching (every request re-samples).
+fn nsql_sample_cache_ttl() -> Duration {
+    let secs = std::env::var("SPICE_NSQL_SAMPLE_CACHE_TTL_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_NSQL_SAMPLE_CACHE_TTL_SECS);
+    Duration::from_secs(secs)
+}
+
+/// Process-wide cache of the (schema | sample) tool-use message blocks NSQL feeds the
+/// model, keyed by (kind, model, sorted table set). `moka`'s `try_get_with` gives
+/// single-flight semantics, so a concurrent cold-start burst computes the fan-out
+/// once *total* (not once per request). Entries expire after the configured TTL, so a
+/// table's schema/sample values are refreshed periodically; structural changes
+/// (datasets added/removed) change the key and self-invalidate.
+static NSQL_SAMPLE_CACHE: LazyLock<
+    moka::future::Cache<String, Arc<Vec<ChatCompletionRequestMessage>>>,
+> = LazyLock::new(|| {
+    moka::future::Cache::builder()
+        .max_capacity(256)
+        .time_to_live(nsql_sample_cache_ttl())
+        .build()
+});
+
+/// Stable cache key for a (kind, model, table-set). Order-independent in the tables so
+/// equivalent requests share an entry.
+fn nsql_cache_key(kind: &str, model: &str, tables: &[TableReference]) -> String {
+    let mut names: Vec<String> = tables.iter().map(ToString::to_string).collect();
+    names.sort();
+    names.dedup();
+    format!("{kind}\u{0}{model}\u{0}{}", names.join("\u{1}"))
+}
+
+/// Build, or reuse from cache, the `table_schema` tool-use messages for `tables`.
+async fn cached_schema_messages(
+    rt: &Arc<Runtime>,
+    model: &str,
+    tables: &[TableReference],
+    allowlist: Option<&ResolvedTableAwareAllowlist>,
+    span: &Span,
+) -> Result<Arc<Vec<ChatCompletionRequestMessage>>, String> {
+    let ttl = nsql_sample_cache_ttl();
+    // Owned captures so the init future is `'static` (required by moka's get-with).
+    let rt = Arc::clone(rt);
+    let allowlist = allowlist.cloned();
+    let table_names: Vec<String> = tables.iter().map(ToString::to_string).collect();
+    let span = span.clone();
+    let init = async move {
+        create_tool_use_messages(
+            &TableSchemaTool::new(rt, None, None).with_table_allowlist(allowlist),
+            "schemas-nsql",
+            &TableSchemaToolParams::new(table_names),
+        )
+        .instrument(span)
+        .await
+        .map(Arc::new)
+    };
+    if ttl.is_zero() {
+        return init.await.map_err(|e| e.to_string());
+    }
+    NSQL_SAMPLE_CACHE
+        .try_get_with(nsql_cache_key("schema", model, tables), init)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Build, or reuse from cache, the data-sampling tool-use messages for `tables`.
+async fn cached_sample_messages(
+    rt: &Arc<Runtime>,
+    model: &str,
+    tables: &[TableReference],
+    allowlist: Option<&ResolvedTableAwareAllowlist>,
+    span: &Span,
+) -> Result<Arc<Vec<ChatCompletionRequestMessage>>, String> {
+    let ttl = nsql_sample_cache_ttl();
+    let rt = Arc::clone(rt);
+    let allowlist = allowlist.cloned();
+    let tables_owned: Vec<TableReference> = tables.to_vec();
+    let span = span.clone();
+    let init = async move {
+        sample_messages(&tables_owned, rt, allowlist)
+            .instrument(span)
+            .await
+            .map(Arc::new)
+    };
+    if ttl.is_zero() {
+        return init.await.map_err(|e| e.to_string());
+    }
+    NSQL_SAMPLE_CACHE
+        .try_get_with(nsql_cache_key("sample", model, tables), init)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "lowercase")]
@@ -479,37 +583,39 @@ pub(crate) async fn handle_nsql_query(
                 .collect(),
         );
 
-    // Create assistant/tool result messages for calling `table_schema` tool for all or provided tables.
-    let schema_messages = match create_tool_use_messages(
-        &TableSchemaTool::new(Arc::clone(&rt), None, None)
-            .with_table_allowlist(table_allowlist_opt.clone()),
-        "schemas-nsql",
-        &TableSchemaToolParams::new(tables.iter().map(ToString::to_string).collect::<Vec<_>>()),
+    // Assistant/tool messages for the `table_schema` tool over all/provided tables.
+    // Cached by (model, table set) with a TTL so the schema fan-out isn't re-run on
+    // every request; see NSQL_SAMPLE_CACHE.
+    let schema_messages = match cached_schema_messages(
+        &rt,
+        &model,
+        &tables,
+        table_allowlist_opt.as_ref(),
+        &span,
     )
-    .instrument(span.clone())
     .await
     {
         Ok(m) => m,
         Err(e) => {
             tracing::error!("Error getting schema messages: {e}");
-            return (StatusCode::INTERNAL_SERVER_ERROR, headers, e.to_string());
+            return (StatusCode::INTERNAL_SERVER_ERROR, headers, e);
         }
     };
 
-    // Create sample data assistant/tool messages if user wants to sample from dataset(s).
+    // Same for the (much heavier) data-sampling messages, only when requested. These
+    // are the ~1-query-per-column DISTINCT + random-sample fan-out across every table.
     let sample_data_messages = if sample_data_enabled {
-        match sample_messages(&tables, Arc::clone(&rt), table_allowlist_opt.clone())
-            .instrument(span.clone())
+        match cached_sample_messages(&rt, &model, &tables, table_allowlist_opt.as_ref(), &span)
             .await
         {
             Ok(m) => m,
             Err(e) => {
                 tracing::error!("Error sampling datasets for NSQL messages: {e}");
-                return (StatusCode::INTERNAL_SERVER_ERROR, headers, e.to_string());
+                return (StatusCode::INTERNAL_SERVER_ERROR, headers, e);
             }
         }
     } else {
-        vec![]
+        Arc::new(Vec::new())
     };
 
     let nql_model = {
@@ -556,8 +662,8 @@ pub(crate) async fn handle_nsql_query(
             );
         };
 
-        req.messages.extend(schema_messages.clone());
-        req.messages.extend(sample_data_messages.clone());
+        req.messages.extend(schema_messages.iter().cloned());
+        req.messages.extend(sample_data_messages.iter().cloned());
         if let Some(prompt_cache_key) = &prompt_cache_key {
             req.prompt_cache_key = Some(prompt_cache_key.clone());
         }
@@ -823,6 +929,38 @@ mod tests {
         assert_eq!(
             error,
             "No model specified and multiple compatible LLM models are configured (first_model, second_model). Include the 'model' field in the request."
+        );
+    }
+
+    #[test]
+    fn cache_key_is_order_independent_and_scoped() {
+        let t1 = vec![
+            TableReference::from("spice.public.a"),
+            TableReference::from("spice.public.b"),
+        ];
+        let t2 = vec![
+            TableReference::from("spice.public.b"),
+            TableReference::from("spice.public.a"),
+        ];
+
+        // Same table set in any order -> identical key (so equivalent requests share an entry).
+        assert_eq!(
+            nsql_cache_key("sample", "m1", &t1),
+            nsql_cache_key("sample", "m1", &t2)
+        );
+
+        // kind, model, and the table set each scope the key.
+        assert_ne!(
+            nsql_cache_key("schema", "m1", &t1),
+            nsql_cache_key("sample", "m1", &t1)
+        );
+        assert_ne!(
+            nsql_cache_key("sample", "m1", &t1),
+            nsql_cache_key("sample", "m2", &t1)
+        );
+        assert_ne!(
+            nsql_cache_key("sample", "m1", &t1),
+            nsql_cache_key("sample", "m1", &[TableReference::from("spice.public.a")])
         );
     }
 }
