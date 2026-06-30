@@ -6,7 +6,7 @@ expression: req_str
   "messages": [
     {
       "role": "system",
-      "content": "Task: Write a SQL query to answer this question: _\\\"SELECT * FROM table\\\"_. Instruction: Return only valid SQL code, nothing additional, don't wrap it in ```. Columns with capitals must be quoted. Write each table name exactly as shown and UNQUOTED, including any schema/catalog prefix, e.g. spice.public.my_table. NEVER wrap a qualified (dotted) table name in a single pair of quotes: \"spice.public.my_table\" is WRONG and will not be found (it is read as one literal name). Only if a name part has capitals or special characters, quote each part separately (\"spice\".\"public\".\"My_Table\"), never the whole dotted string."
+      "content": "Task: Write a SQL query to answer this question: _\\\"SELECT * FROM table\\\"_. Instruction: Return only valid SQL code, nothing additional, don't wrap it in ```. Columns with capitals must be quoted. Write each table name exactly as shown and UNQUOTED, including any schema/catalog prefix, e.g. spice.public.my_table. NEVER wrap a qualified (dotted) table name in a single pair of quotes: \"spice.public.my_table\" is WRONG and will not be found (it is read as one literal name). Only if a name part has capitals or special characters, quote each part separately (\"spice\".\"public\".\"My_Table\"), never the whole dotted string. Use ONLY the tables and columns shown in the schema and sample messages provided above; never invent, guess, abbreviate, or rename a table or column. If the question mentions something not present in the schema, map it to the closest existing table/column instead of inventing a new name."
     }
   ],
   "model": "model_id",

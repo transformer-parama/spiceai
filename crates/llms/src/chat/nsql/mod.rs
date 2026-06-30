@@ -65,7 +65,7 @@ pub trait SqlGeneration: Sync + Send {
 #[must_use]
 pub fn create_prompt(query: &str, ctx: &QueryGenerationContext) -> String {
     let mut prompt = format!(
-        r#"Task: Write a SQL query to answer this question: _\"{query}\"_. Instruction: Return only valid SQL code, nothing additional, don't wrap it in ```. Columns with capitals must be quoted. Write each table name exactly as shown and UNQUOTED, including any schema/catalog prefix, e.g. spice.public.my_table. NEVER wrap a qualified (dotted) table name in a single pair of quotes: "spice.public.my_table" is WRONG and will not be found (it is read as one literal name). Only if a name part has capitals or special characters, quote each part separately ("spice"."public"."My_Table"), never the whole dotted string."#
+        r#"Task: Write a SQL query to answer this question: _\"{query}\"_. Instruction: Return only valid SQL code, nothing additional, don't wrap it in ```. Columns with capitals must be quoted. Write each table name exactly as shown and UNQUOTED, including any schema/catalog prefix, e.g. spice.public.my_table. NEVER wrap a qualified (dotted) table name in a single pair of quotes: "spice.public.my_table" is WRONG and will not be found (it is read as one literal name). Only if a name part has capitals or special characters, quote each part separately ("spice"."public"."My_Table"), never the whole dotted string. Use ONLY the tables and columns shown in the schema and sample messages provided above; never invent, guess, abbreviate, or rename a table or column. If the question mentions something not present in the schema, map it to the closest existing table/column instead of inventing a new name."#
     );
 
     if !ctx.failed_attempts.is_empty() {
@@ -84,7 +84,7 @@ pub fn create_prompt(query: &str, ctx: &QueryGenerationContext) -> String {
             .map_or("my_table", String::as_str);
         let _ = write!(
             prompt,
-            "\n\nSemantic search: these tables support vector similarity search over text: {tables}. For a question asking for text semantically similar to / about / relevant to a topic, do NOT use LIKE and do NOT invent functions (no SIMILARITY()); use the table function `vector_search`. CRITICAL RULES: (1) its FIRST argument is the table name written as a BARE, UNQUOTED identifier — never a quoted string. (2) Use LIMIT for top-k, never TOP. Example: SELECT _score, text FROM vector_search({example}, 'the search phrase', 5) ORDER BY _score DESC LIMIT 5. It returns a `_score` column (higher = more relevant) plus the table's columns."
+            "\n\nSemantic search: these tables support vector similarity search over text: {tables}. For a question asking for text semantically similar to / about / relevant to a topic, do NOT use LIKE and do NOT use or invent full-text-search or similarity functions (none of SIMILARITY, to_tsvector, to_tsquery, plainto_tsquery, websearch_to_tsquery, ts_rank, ts_rank_cd exist here); use the table function `vector_search`. CRITICAL RULES: (1) its FIRST argument is the table name written as a BARE, UNQUOTED identifier — never a quoted string. (2) Use LIMIT for top-k, never TOP. Example: SELECT _score, text FROM vector_search({example}, 'the search phrase', 5) ORDER BY _score DESC LIMIT 5. It returns a `_score` column (higher = more relevant) plus the table's columns."
         );
     }
 
