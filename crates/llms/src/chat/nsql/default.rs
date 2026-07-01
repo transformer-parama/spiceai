@@ -14,8 +14,9 @@ limitations under the License.
 use async_openai::{
     error::OpenAIError,
     types::chat::{
-        ChatCompletionRequestSystemMessageArgs, CreateChatCompletionRequest,
-        CreateChatCompletionRequestArgs, CreateChatCompletionResponse, ResponseFormat,
+        ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestUserMessageArgs,
+        CreateChatCompletionRequest, CreateChatCompletionRequestArgs,
+        CreateChatCompletionResponse, ResponseFormat,
     },
 };
 
@@ -35,9 +36,17 @@ impl SqlGeneration for DefaultSqlGeneration {
         CreateChatCompletionRequestArgs::default()
             .model(model_id)
             .response_format(ResponseFormat::Text)
+            // System carries the full prompt; a `user` message carries the raw NL
+            // query so chat templates that require a `user` role (e.g. Qwen on
+            // vLLM: "No user query found in messages") accept the request instead
+            // of silently falling back to another model behind a LiteLLM proxy.
             .messages(vec![
                 ChatCompletionRequestSystemMessageArgs::default()
                     .content(prompt)
+                    .build()?
+                    .into(),
+                ChatCompletionRequestUserMessageArgs::default()
+                    .content(query.to_string())
                     .build()?
                     .into(),
             ])

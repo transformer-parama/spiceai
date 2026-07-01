@@ -15,8 +15,9 @@ use async_openai::{
     error::OpenAIError,
     types::chat::{
         ChatCompletionRequestMessage, ChatCompletionRequestSystemMessageArgs,
-        CreateChatCompletionRequest, CreateChatCompletionRequestArgs, CreateChatCompletionResponse,
-        ResponseFormat, ResponseFormatJsonSchema,
+        ChatCompletionRequestUserMessageArgs, CreateChatCompletionRequest,
+        CreateChatCompletionRequestArgs, CreateChatCompletionResponse, ResponseFormat,
+        ResponseFormatJsonSchema,
     },
 };
 use schemars::{JsonSchema, schema_for};
@@ -40,9 +41,18 @@ impl SqlGeneration for StructuredOutputSqlGeneration {
     ) -> Result<CreateChatCompletionRequest, OpenAIError> {
         let prompt = create_prompt(query, context);
 
+        // The full generation prompt (schema, instructions, and the NL question)
+        // goes in the system message. We ALSO carry the raw NL query as a `user`
+        // message: some chat templates (e.g. Qwen on vLLM) reject a request that
+        // has no `user` role with "No user query found in messages", which then
+        // silently falls back to a different model behind a LiteLLM proxy.
         let messages: Vec<ChatCompletionRequestMessage> = vec![
             ChatCompletionRequestSystemMessageArgs::default()
                 .content(prompt)
+                .build()?
+                .into(),
+            ChatCompletionRequestUserMessageArgs::default()
+                .content(query.to_string())
                 .build()?
                 .into(),
         ];

@@ -15,8 +15,8 @@ use async_openai::{
     error::OpenAIError,
     types::chat::{
         ChatCompletionRequestMessage, ChatCompletionRequestSystemMessageArgs,
-        CreateChatCompletionRequest, CreateChatCompletionRequestArgs, CreateChatCompletionResponse,
-        ResponseFormat,
+        ChatCompletionRequestUserMessageArgs, CreateChatCompletionRequest,
+        CreateChatCompletionRequestArgs, CreateChatCompletionResponse, ResponseFormat,
     },
 };
 
@@ -49,6 +49,13 @@ impl SqlGeneration for JsonSchemaSqlGeneration {
                 .into(),
             ChatCompletionRequestSystemMessageArgs::default()
                 .content("Response Format: JSON, with the postgres SQL under 'sql'.")
+                .build()?
+                .into(),
+            // Carry the raw NL query as a `user` message so chat templates that
+            // require a `user` role (e.g. Qwen on vLLM: "No user query found in
+            // messages") accept the request instead of silently falling back.
+            ChatCompletionRequestUserMessageArgs::default()
+                .content(query.to_string())
                 .build()?
                 .into(),
         ];
