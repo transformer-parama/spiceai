@@ -42,18 +42,18 @@ impl SqlGeneration for JsonSchemaSqlGeneration {
     ) -> Result<CreateChatCompletionRequest, OpenAIError> {
         let prompt = create_prompt(query, context);
 
+        // Qwen's vLLM chat template rejects a request that has MORE THAN ONE
+        // system message (and any with no `user` role); LiteLLM then silently
+        // falls back to another model (e.g. gpt-4o-mini) at HTTP 200. So keep
+        // exactly ONE system message (prompt + response-format instruction) and
+        // ONE user message carrying the raw NL query.
         let messages: Vec<ChatCompletionRequestMessage> = vec![
             ChatCompletionRequestSystemMessageArgs::default()
-                .content(prompt)
+                .content(format!(
+                    "{prompt}\n\nResponse Format: JSON, with the postgres SQL under 'sql'."
+                ))
                 .build()?
                 .into(),
-            ChatCompletionRequestSystemMessageArgs::default()
-                .content("Response Format: JSON, with the postgres SQL under 'sql'.")
-                .build()?
-                .into(),
-            // Carry the raw NL query as a `user` message so chat templates that
-            // require a `user` role (e.g. Qwen on vLLM: "No user query found in
-            // messages") accept the request instead of silently falling back.
             ChatCompletionRequestUserMessageArgs::default()
                 .content(query.to_string())
                 .build()?
