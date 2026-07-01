@@ -164,7 +164,24 @@ fn clean_model_based_sql(input: &str) -> String {
 
     // Only take the first query, if there are multiple.
     let one_query = no_dashes.split(';').next().unwrap_or(&no_dashes);
-    one_query.trim().to_string()
+
+    // Models using a JSON / structured-output response format sometimes leak the
+    // JSON envelope into the SQL value: a stray leading `{`, a wrapping ```sql
+    // fence, or — the case we actually hit — a trailing `}` on its own line.
+    // None of these are ever valid at the start/end of a SQL statement, so strip
+    // them; this fixes `Expected: end of statement, found: }` parse errors
+    // without touching any `{`/`}` inside the statement (e.g. string literals).
+    one_query
+        .trim()
+        .trim_start_matches("```sql")
+        .trim_start_matches("```SQL")
+        .trim_start_matches("```")
+        .trim_end_matches("```")
+        .trim()
+        .trim_start_matches('{')
+        .trim_end_matches(|c: char| c == '}' || c.is_whitespace())
+        .trim()
+        .to_string()
 }
 
 /// Create subsequent Assistant and Tool messages simulating a model requesting to use the `sample_data` tool, then receiving the result for the following sampling methods:
