@@ -144,6 +144,32 @@ pub fn new_azure_client(
     )
 }
 
+/// A `reqwest` client tuned to survive the host machine sleeping/suspending.
+///
+/// async-openai's default (`reqwest::Client::new()`) keeps idle keep-alive
+/// connections with NO TCP keepalive and NO request timeout. After a laptop
+/// suspend, the pooled TCP connections to a remote LLM endpoint are dead but not
+/// evicted -- `pool_idle_timeout` is measured in monotonic time, which does not
+/// advance during suspend -- so the next request reuses a dead socket and hangs
+/// forever, wedging `/v1/nsql` until its budget fires (data-plane `/v1/sql` is
+/// unaffected because it never uses this client). Restarting the process is the
+/// only recovery. This client removes that failure mode:
+///   * `pool_max_idle_per_host(0)` -- never reuse an idle keep-alive connection,
+///     so a socket that died during suspend can never be handed out.
+///   * `tcp_keepalive` -- detect dead sockets in real (wall-clock) time.
+///   * `connect_timeout` + `timeout` -- a stuck connection fails fast instead of
+///     hanging indefinitely.
+#[must_use]
+fn resilient_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .pool_max_idle_per_host(0)
+        .tcp_keepalive(std::time::Duration::from_secs(30))
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(180))
+        .build()
+        .unwrap_or_default()
+}
+
 #[must_use]
 pub fn new_azure_client_with_chat_backend(
     model: String,
@@ -173,7 +199,7 @@ pub fn new_azure_client_with_chat_backend(
     }
 
     Openai {
-        client: Client::with_config(cfg),
+        client: Client::with_config(cfg).with_http_client(resilient_http_client()),
         model,
         rate_controller: default_rate_controller(),
         chat_backend,
@@ -229,7 +255,7 @@ pub fn new_openai_client_with_chat_backend(
     }
 
     Openai {
-        client: Client::with_config(cfg),
+        client: Client::with_config(cfg).with_http_client(resilient_http_client()),
         model,
         rate_controller: usage_tier.map_or_else(default_rate_controller, Into::into),
         chat_backend,
@@ -242,7 +268,7 @@ pub fn new_openai_client_with_config<C: async_openai::config::Config + Clone>(
     cfg: C,
 ) -> Openai<C> {
     Openai {
-        client: Client::with_config(cfg),
+        client: Client::with_config(cfg).with_http_client(resilient_http_client()),
         model,
         rate_controller: default_rate_controller(),
         chat_backend: ChatBackend::ChatCompletions,
