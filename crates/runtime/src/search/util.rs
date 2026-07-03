@@ -45,7 +45,7 @@ use crate::search::full_text::as_es_text_candidate_generations;
 use super::{Error, Result};
 
 /// Attempt to return a concrete [`TableProvider`] type from a given [`impl TableProvider`]. This includes if the [`TableProvider`] is a base table for an [`AcceleratedTable`] or [`FederatedTableProviderAdaptor`] or other known [`TableProvider`] that wrap a table.
-pub(crate) fn find_concrete_table_provider<T: TableProvider + 'static>(
+pub fn find_concrete_table_provider<T: TableProvider + 'static>(
     tbl: &Arc<dyn TableProvider>,
 ) -> Option<&T> {
     let mut current_tbl = tbl;

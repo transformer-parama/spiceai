@@ -70,14 +70,16 @@ impl TableFunctionImpl for GraphQueryTableFunc {
                 ))
             })?;
 
-        let neo = provider
-            .as_any()
-            .downcast_ref::<Neo4jTableProvider>()
-            .ok_or_else(|| {
-                DataFusionError::Plan(format!(
-                    "{GRAPH_QUERY_UDTF_NAME}(): dataset '{dataset}' is not a neo4j dataset"
-                ))
-            })?;
+        // A registered dataset's provider is wrapped (metadata / federation adaptor),
+        // so unwrap to the concrete Neo4jTableProvider to borrow its connection.
+        let neo = runtime::search::util::find_concrete_table_provider::<Neo4jTableProvider>(
+            &provider,
+        )
+        .ok_or_else(|| {
+            DataFusionError::Plan(format!(
+                "{GRAPH_QUERY_UDTF_NAME}(): dataset '{dataset}' is not a neo4j dataset"
+            ))
+        })?;
         let conn = neo.connection();
 
         // Infer the output schema by describing the Cypher. `call()` is sync but the
