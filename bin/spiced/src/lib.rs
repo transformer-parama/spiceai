@@ -614,6 +614,18 @@ pub async fn run(args: Args) -> Result<()> {
 
     let rt = builder.build().await;
 
+    // Register the neo4j `graph_query('<dataset>', '<cypher>')` table function on the
+    // built runtime's SessionContext. It lives in connector-neo4j (runtime cannot depend
+    // on that crate — it would be a dependency cycle), so it is wired in here where both
+    // the runtime and the connector are visible.
+    #[cfg(feature = "neo4j")]
+    rt.datafusion().ctx.register_udtf(
+        connector_neo4j::GRAPH_QUERY_UDTF_NAME,
+        std::sync::Arc::new(connector_neo4j::GraphQueryTableFunc::new(
+            std::sync::Arc::downgrade(&rt.datafusion()),
+        )),
+    );
+
     spiced_tracing::init_tracing(
         app.as_ref(),
         tracing_config.as_ref(),

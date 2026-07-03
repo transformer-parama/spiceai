@@ -28,8 +28,11 @@ limitations under the License.
 //! datasets and queries served by this connector.
 
 mod exec;
+mod graph_query;
 mod neo4j;
 mod table_provider;
+
+pub use graph_query::{GraphQueryTableFunc, GRAPH_QUERY_UDTF_NAME};
 
 use std::any::Any;
 use std::future::Future;

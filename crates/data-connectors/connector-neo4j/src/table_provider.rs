@@ -53,6 +53,13 @@ impl Neo4jTableProvider {
     pub fn new(conn: Arc<Neo4jConnection>, label: String, schema: SchemaRef) -> Self {
         Self { conn, label, schema }
     }
+
+    /// Borrow this dataset's Neo4j connection (used by the `graph_query` UDTF to
+    /// run an arbitrary Cypher statement over the same connection).
+    #[must_use]
+    pub fn connection(&self) -> Arc<Neo4jConnection> {
+        Arc::clone(&self.conn)
+    }
 }
 
 /// Backtick-escape a Cypher identifier (label or property name).
