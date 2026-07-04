@@ -45,6 +45,53 @@ fn string_arg(expr: &Expr, which: &str) -> Result<String> {
     }
 }
 
+/// Default cap on rows a single `graph_query` call may return.
+const DEFAULT_MAX_ROWS: usize = 10_000;
+
+/// Row cap, overridable via `SPICE_GRAPH_QUERY_MAX_ROWS` (`0` disables the wrap/cap).
+fn max_rows() -> usize {
+    std::env::var("SPICE_GRAPH_QUERY_MAX_ROWS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_MAX_ROWS)
+}
+
+/// Cypher clauses that mutate the graph or load external data. `graph_query` is a
+/// READ-ONLY retrieval primitive, so any of these is rejected — defence against
+/// injection / accidental writes when the Cypher is built from untrusted input.
+const WRITE_KEYWORDS: &[&str] = &[
+    "CREATE", "MERGE", "DELETE", "SET", "REMOVE", "DROP", "DETACH", "FOREACH", "LOAD",
+];
+
+/// Reject Cypher containing a write/DDL clause. Tokenises on non-identifier characters
+/// so `set_value`/`created_at` are single tokens that do NOT match `SET`/`CREATE`, while
+/// `apoc.create` -> [`apoc`,`create`] IS caught. Conservative: a write keyword inside a
+/// string literal is also rejected (rephrase if needed) — safety over convenience.
+fn ensure_read_only(cypher: &str) -> Result<()> {
+    for token in cypher.split(|c: char| !(c.is_alphanumeric() || c == '_')) {
+        if token.is_empty() {
+            continue;
+        }
+        if WRITE_KEYWORDS.contains(&token.to_ascii_uppercase().as_str()) {
+            return Err(DataFusionError::Plan(format!(
+                "{GRAPH_QUERY_UDTF_NAME}(): only read-only Cypher is allowed; found write clause '{token}'"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Wrap the (already read-only) Cypher so at most `cap` rows are returned, using the same
+/// `CALL {{ ... }} RETURN *` shape as schema inference so RETURN columns are preserved.
+fn with_row_cap(cypher: &str, cap: usize) -> String {
+    let inner = cypher.trim().trim_end_matches(';').trim();
+    if cap == 0 {
+        inner.to_string()
+    } else {
+        format!("CALL {{ {inner} }} RETURN * LIMIT {cap}")
+    }
+}
+
 impl TableFunctionImpl for GraphQueryTableFunc {
     fn call(&self, args: &[Expr]) -> Result<Arc<dyn TableProvider>> {
         if args.len() != 2 {
@@ -55,6 +102,10 @@ impl TableFunctionImpl for GraphQueryTableFunc {
         }
         let dataset = string_arg(&args[0], "first (neo4j dataset name)")?;
         let cypher = string_arg(&args[1], "second (Cypher query)")?;
+
+        // Safety: read-only only, and cap the row count.
+        ensure_read_only(&cypher)?;
+        let cypher = with_row_cap(&cypher, max_rows());
 
         let df = self.df.upgrade().ok_or_else(|| {
             DataFusionError::Plan(format!(
@@ -106,5 +157,49 @@ impl TableFunctionImpl for GraphQueryTableFunc {
         ));
 
         Ok(Arc::new(CypherTableProvider::new(conn, cypher, schema)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn read_only_accepts_reads() {
+        for q in [
+            "MATCH (a:Chunk)-[:NEXT*1..3]->(b) RETURN a.idx, b.idx",
+            "CALL db.relationshipTypes() YIELD relationshipType RETURN relationshipType",
+            "MATCH (n) WHERE n.created_at > 0 RETURN n.set_value AS v LIMIT 5",
+            "MATCH (a)-[r]->(b) RETURN type(r), count(*)",
+        ] {
+            assert!(ensure_read_only(q).is_ok(), "should be read-only: {q}");
+        }
+    }
+
+    #[test]
+    fn read_only_rejects_writes() {
+        for q in [
+            "MATCH (a) CREATE (a)-[:R]->(b)",
+            "MERGE (n:X {id: 1})",
+            "MATCH (n) DELETE n",
+            "MATCH (n) DETACH DELETE n",
+            "MATCH (n) SET n.x = 1",
+            "MATCH (n) REMOVE n.x",
+            "CALL apoc.create.node(['X'], {})",
+            "LOAD CSV FROM 'file:///x.csv' AS row RETURN row",
+        ] {
+            assert!(ensure_read_only(q).is_err(), "should be rejected: {q}");
+        }
+    }
+
+    #[test]
+    fn row_cap_wraps_and_strips_semicolon() {
+        let out = with_row_cap("MATCH (n) RETURN n.id AS id ;", 100);
+        assert_eq!(out, "CALL { MATCH (n) RETURN n.id AS id } RETURN * LIMIT 100");
+    }
+
+    #[test]
+    fn row_cap_zero_disables_wrap() {
+        assert_eq!(with_row_cap("MATCH (n) RETURN n", 0), "MATCH (n) RETURN n");
     }
 }
