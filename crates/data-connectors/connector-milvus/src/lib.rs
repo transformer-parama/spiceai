@@ -56,6 +56,7 @@ pub struct MilvusConnector {
     vector_field: String,
     metric: String,
     output_fields: Vec<String>,
+    partition: Option<String>,
 }
 
 impl std::fmt::Debug for MilvusConnector {
@@ -121,6 +122,8 @@ const PARAMETERS: &[ParameterSpec] = &[
         .default("COSINE"),
     ParameterSpec::component("output_fields")
         .description("Comma-separated scalar fields to return (default: all scalar fields)."),
+    ParameterSpec::component("partition")
+        .description("Optional Milvus partition to scope to (per-tenant isolation)."),
 ];
 
 impl DataConnectorFactory for MilvusFactory {
@@ -191,6 +194,7 @@ impl DataConnectorFactory for MilvusFactory {
                 vector_field: p("vector_field").unwrap_or_default(),
                 metric: p("metric").unwrap_or_else(|| "COSINE".to_string()),
                 output_fields,
+                partition: p("partition"),
             }) as Arc<dyn DataConnector>)
         })
     }
@@ -269,6 +273,7 @@ impl DataConnector for MilvusConnector {
             vector_field,
             metric: self.metric.clone(),
             output_fields,
+            partition: self.partition.clone(),
         };
         Ok(Arc::new(MilvusTableProvider::new(Arc::clone(&self.conn), coll, schema))
             as Arc<dyn TableProvider>)

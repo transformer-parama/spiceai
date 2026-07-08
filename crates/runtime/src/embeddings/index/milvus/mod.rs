@@ -27,7 +27,7 @@ use std::time::Duration;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::sql::TableReference;
 use llms::embeddings::get_or_infer_size;
-use milvus_client::{ConnectionConfig, MilvusCollection, MilvusConnection};
+use milvus_client::{ConnectionConfig, MilvusCollection, MilvusConnection, arrow_type_for};
 use search::index::milvus::MilvusVector;
 use spicepod::{param::Params, semantic::ColumnLevelEmbeddingConfig, vector::VectorStore};
 use tokio::sync::RwLock;
@@ -45,6 +45,8 @@ pub(crate) const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("vector_field")
         .description("Vector field name (introspected from the collection if unset)."),
     ParameterSpec::component("metric").description("Distance metric: COSINE | L2 | IP."),
+    ParameterSpec::component("partition")
+        .description("Optional Milvus partition to scope searches to (per-tenant isolation)."),
     ParameterSpec::component("token")
         .description("Bearer token (`username:password`, or an API key).")
         .secret(),
@@ -201,6 +203,9 @@ pub async fn try_from_table(
     let metric = string_from_params(&params, "metric")
         .unwrap_or("COSINE")
         .to_string();
+    // Optional per-tenant partition: scope every ANN search to this Milvus partition
+    // (isolation for multi-assistant collections partitioned by assistant_id).
+    let partition = string_from_params(&params, "partition").map(str::to_string);
 
     // Dimension: configured `vector_size`, else inferred from the model.
     let dimension: i32 = match config.vector_size {
@@ -210,17 +215,36 @@ pub async fn try_from_table(
             .map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(e.to_string()))?,
     };
 
-    // The index returns the primary key(s) + a `score` column; the search layer
-    // joins these back to the base table on the primary key.
-    let output_fields: Vec<String> = primary_key.iter().map(|f| f.name().clone()).collect();
+    // Milvus-only mode: when the base table IS the Milvus collection itself (the
+    // `from: milvus:<collection>` connector, detectable by its `query_vector`
+    // input column), the collection holds ALL scalar columns (text, etc.), not
+    // just the vectors. Return every scalar field so the search layer serves the
+    // row data directly from Milvus — no join-back to a separate base table.
+    // Otherwise (Postgres/Iceberg base) keep the classic primary-key + score and
+    // let `SearchQueryProvider` join back to that base for the row data.
+    let milvus_only = inner_schema.column_with_name("query_vector").is_some();
+
+    // The index returns these data columns + a `score` column. In Milvus-only
+    // mode that's every scalar (non-vector) field; otherwise just the primary key.
+    let data_fields: Vec<Field> = if milvus_only {
+        fields
+            .iter()
+            .filter(|f| !f.is_vector)
+            .map(|f| Field::new(&f.name, arrow_type_for(&f.type_name), true))
+            .collect()
+    } else {
+        primary_key.clone()
+    };
+    let output_fields: Vec<String> = data_fields.iter().map(|f| f.name().clone()).collect();
     let coll = MilvusCollection {
         collection,
         vector_field,
         metric,
         output_fields,
+        partition,
     };
 
-    let mut schema_fields: Vec<Field> = primary_key.clone();
+    let mut schema_fields: Vec<Field> = data_fields;
     schema_fields.push(Field::new("score", DataType::Float32, false));
     let schema: SchemaRef = Arc::new(Schema::new(schema_fields));
 

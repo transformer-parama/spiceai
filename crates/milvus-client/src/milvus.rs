@@ -76,6 +76,9 @@ pub struct MilvusCollection {
     pub vector_field: String,
     pub metric: String, // COSINE | L2 | IP
     pub output_fields: Vec<String>,
+    /// Optional partition to scope the search to (per-tenant isolation). When set, the
+    /// ANN search only looks inside this partition instead of the whole collection.
+    pub partition: Option<String>,
 }
 
 impl MilvusCollection {
@@ -161,6 +164,8 @@ struct SearchBody<'a> {
     output_fields: &'a [String],
     #[serde(skip_serializing_if = "Option::is_none")]
     filter: Option<String>,
+    #[serde(rename = "partitionNames", skip_serializing_if = "Option::is_none")]
+    partition_names: Option<Vec<&'a str>>,
     #[serde(rename = "searchParams")]
     search_params: Value,
 }
@@ -296,6 +301,7 @@ impl MilvusConnection {
             limit,
             output_fields: &coll.output_fields,
             filter,
+            partition_names: coll.partition.as_deref().map(|p| vec![p]),
             search_params: json!({ "metricType": coll.metric }),
         };
         let flip = coll.is_distance_metric();
@@ -381,6 +387,7 @@ mod tests {
             vector_field: "embedding".to_string(),
             metric: metric.to_string(),
             output_fields: vec!["title".to_string()],
+            partition: None,
         }
     }
 

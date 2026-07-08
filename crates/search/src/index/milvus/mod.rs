@@ -146,13 +146,27 @@ impl SearchIndex for MilvusVector {
             query.to_string(),
         ));
 
-        // Project the primary key(s) + the score column, aliased to the search
-        // layer's internal score name. The SearchQueryProvider joins these back
-        // to the base table on the primary key to materialize the row data.
-        let mut projection: Vec<_> = self.primary_key.iter().map(|f| col(f.name())).collect();
-        // /v1/search aggregation requires the score column to be Float64; the
-        // Milvus exec produces Float32, so cast it here.
-        projection.push(cast(col(MILVUS_SCORE_NAME), DataType::Float64).alias(SEARCH_SCORE_COLUMN_NAME));
+        // Project every column the index returns: pass the data columns through,
+        // and cast the `score` column to Float64 aliased to the search layer's
+        // score name (/v1/search aggregation requires Float64; the Milvus exec
+        // emits Float32). For a classic base+vectors index the table schema is
+        // just primary_key + score, so this yields primary_key + _score (and the
+        // SearchQueryProvider joins back for the rest). For a Milvus-only index
+        // the table schema is every scalar column + score, so the row data comes
+        // straight from Milvus with no join-back.
+        let projection: Vec<_> = self
+            .table
+            .schema
+            .fields()
+            .iter()
+            .map(|f| {
+                if f.name() == MILVUS_SCORE_NAME {
+                    cast(col(MILVUS_SCORE_NAME), DataType::Float64).alias(SEARCH_SCORE_COLUMN_NAME)
+                } else {
+                    col(f.name())
+                }
+            })
+            .collect();
 
         Ok(LogicalPlanBuilder::scan(
             "tbl",
@@ -251,6 +265,7 @@ mod tests {
             vector_field: "embedding".to_string(),
             metric: "COSINE".to_string(),
             output_fields: vec!["source_id".to_string(), "text".to_string()],
+            partition: None,
         };
         let table = MilvusVectorsTable::new(conn, coll, schema, 8);
 
@@ -264,10 +279,12 @@ mod tests {
     }
 
     /// The contract `/v1/search` aggregation relies on: the index's logical plan
-    /// projects the primary key(s) plus a `_score` column, and `_score` is
-    /// Float64 (the Milvus exec emits Float32, so it must be cast).
+    /// projects every data column the index carries plus a `_score` column, and
+    /// `_score` is Float64 (the Milvus exec emits Float32, so it must be cast).
+    /// The stub table schema is {source_id, text, score}, so the plan surfaces
+    /// {source_id, text, _score}.
     #[test]
-    fn query_table_provider_projects_primary_key_and_float64_score() {
+    fn query_table_provider_projects_columns_and_float64_score() {
         let mv = stub_milvus_vector();
         let plan = mv
             .query_table_provider("reduce patient wait times")
@@ -275,7 +292,7 @@ mod tests {
 
         let fields = plan.schema().fields();
         let names: Vec<&str> = fields.iter().map(|f| f.name().as_str()).collect();
-        assert_eq!(names, vec!["source_id", SEARCH_SCORE_COLUMN_NAME]);
+        assert_eq!(names, vec!["source_id", "text", SEARCH_SCORE_COLUMN_NAME]);
 
         let score = fields
             .iter()
