@@ -116,10 +116,19 @@ pub fn format_models_hint(models: &[String], provider_name: &str) -> String {
 }
 
 /// Creates an HTTP client with standard timeout and TLS settings.
+///
+/// Mirrors the anti-wedge settings of `openai::resilient_http_client()` so the
+/// reranker / list-models paths survive a laptop suspend the same way chat + embed
+/// do: `pool_max_idle_per_host(0)` prevents handing out a keep-alive socket that
+/// died during suspend (whose eviction timer, on monotonic time, never advanced),
+/// and `tcp_keepalive` detects dead sockets in real time. Without these, `rerank()`
+/// reuses a dead connection after resume and stalls until the request timeout.
 #[must_use]
 pub fn create_http_client() -> Option<reqwest::Client> {
     reqwest::Client::builder()
         .user_agent(util::spiceai_user_agent())
+        .pool_max_idle_per_host(0)
+        .tcp_keepalive(std::time::Duration::from_secs(30))
         .connect_timeout(std::time::Duration::from_secs(10))
         .timeout(API_TIMEOUT)
         .use_rustls_tls()
