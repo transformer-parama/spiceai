@@ -37,18 +37,30 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
 };
+use futures::StreamExt;
 use serde_json::{Map, Value};
 
 use crate::neo4j::Neo4jConnection;
 
-/// Map a Neo4j property type name to an Arrow `DataType`. Anything unmapped
-/// (arrays, temporal, spatial) falls back to Utf8 (stringified).
+/// Rows per emitted `RecordBatch`. Bounds Arrow allocation per batch and lets
+/// downstream operators (e.g. LIMIT) short-circuit without materialising every row.
+const EXEC_BATCH_ROWS: usize = 1024;
+
+/// Map a Neo4j property type name to an Arrow `DataType`.
+///
+/// Only scalar Neo4j types get a native Arrow type. Everything else — nodes,
+/// relationships, paths, lists, maps, and temporal/spatial values — maps to `Utf8`
+/// and is rendered as its JSON text by the row builder. This is intentional and
+/// lossless for retrieval (`RETURN c.content AS text`); it means a caller who wants
+/// a native date/number from such a value must project a scalar in the Cypher RETURN
+/// (e.g. `RETURN c.date.epochSeconds AS ts`) or `CAST(...)` in the outer SQL, rather
+/// than relying on the connector to parse a stringified structure.
 pub fn arrow_type_for(neo4j_type: &str) -> DataType {
     match neo4j_type {
         "Long" | "Integer" => DataType::Int64,
         "Double" | "Float" => DataType::Float64,
         "Boolean" => DataType::Boolean,
-        "String" => DataType::Utf8,
+        // "String" and every unmapped (structural/temporal) type -> Utf8.
         _ => DataType::Utf8,
     }
 }
@@ -178,10 +190,29 @@ impl ExecutionPlan for Neo4jExec {
                 .await
                 .map_err(|e| DataFusionError::External(Box::new(e)))?;
             tracing::debug!(target: "connector_neo4j", rows = rows.len(), "neo4j query ok");
-            Self::build_batch(&schema, &rows)
+            // Split the (fully-fetched) rows into bounded RecordBatches so downstream
+            // operators pipeline and Arrow allocations stay capped per batch, and a
+            // LIMIT above can short-circuit after the first batch. The JSON rows
+            // themselves arrive in one HTTP response (the tx/commit endpoint has no
+            // cursor) — true server-side streaming would need the Bolt protocol.
+            let batches: Vec<RecordBatch> = if rows.is_empty() {
+                // Preserve a single empty batch so 0-row / COUNT(*) schemas still flow.
+                vec![Self::build_batch(&schema, &rows)?]
+            } else {
+                rows.chunks(EXEC_BATCH_ROWS)
+                    .map(|chunk| Self::build_batch(&schema, chunk))
+                    .collect::<Result<Vec<_>>>()?
+            };
+            Ok::<Vec<RecordBatch>, DataFusionError>(batches)
         };
 
-        let stream = futures::stream::once(fut);
+        // Flatten the future-of-batches into a stream of individual batches.
+        let stream = futures::stream::once(fut).flat_map(|res| match res {
+            Ok(batches) => {
+                futures::stream::iter(batches.into_iter().map(Ok).collect::<Vec<_>>()).boxed()
+            }
+            Err(e) => futures::stream::iter(vec![Err(e)]).boxed(),
+        });
         Ok(Box::pin(RecordBatchStreamAdapter::new(self.projected_schema.clone(), stream)))
     }
 }

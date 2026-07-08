@@ -256,22 +256,36 @@ impl Neo4jConnection {
         out
     }
 
-    /// Infer the schema of an arbitrary read Cypher query by sampling one row
-    /// (`CALL { <cypher> } RETURN * LIMIT 1`). Column names come from the result
-    /// columns (present even with no rows); types are inferred from the sample
-    /// value, defaulting to String.
+    /// Infer the schema of an arbitrary read Cypher query by sampling up to
+    /// [`SCHEMA_SAMPLE_ROWS`] rows (`CALL { <cypher> } RETURN * LIMIT N`) and
+    /// MERGING the JSON types observed for each column across all sampled rows.
+    ///
+    /// Merging (rather than reading a single row) removes two correctness bugs:
+    ///   * the column type no longer depends on which row Neo4j returned first
+    ///     (mixed Int/Double now widen to Double instead of silently nulling the
+    ///     rows that don't fit the first row's guess), and
+    ///   * a single NULL/absent value in the sampled row no longer collapses a
+    ///     whole numeric column to String.
+    ///
+    /// A column with no non-null sample (empty result, or all-null) defaults to
+    /// String — the lossless fallback, since the row builder stringifies anything.
     pub async fn describe_cypher(&self, cypher: &str) -> Result<Vec<PropertyField>, Neo4jError> {
-        let probe = format!("CALL {{ {cypher} }} RETURN * LIMIT 1");
+        let probe = format!("CALL {{ {cypher} }} RETURN * LIMIT {SCHEMA_SAMPLE_ROWS}");
         let (cols, rows) = self.run_query_cols(&probe, Value::Null).await?;
         Ok(cols
             .into_iter()
             .map(|name| {
-                let type_name = rows
-                    .first()
-                    .and_then(|r| r.get(&name))
-                    .map(neo4j_type_of)
-                    .unwrap_or("String")
-                    .to_string();
+                let mut merged: Option<InferredType> = None;
+                for r in &rows {
+                    match r.get(&name) {
+                        Some(v) if !v.is_null() => {
+                            let t = InferredType::from_value(v);
+                            merged = Some(merged.map_or(t, |m| m.merge(t)));
+                        }
+                        _ => {}
+                    }
+                }
+                let type_name = merged.map_or("String", InferredType::neo4j_name).to_string();
                 PropertyField { name, type_name }
             })
             .collect())
@@ -340,19 +354,53 @@ impl Neo4jConnection {
     }
 }
 
-/// Infer a Neo4j-ish type name from a sampled JSON value (for Cypher-passthrough
-/// schema inference). Maps onward via `exec::arrow_type_for`.
-fn neo4j_type_of(v: &Value) -> &'static str {
-    match v {
-        Value::Bool(_) => "Boolean",
-        Value::Number(n) => {
-            if n.is_i64() || n.is_u64() {
-                "Long"
-            } else {
-                "Double"
-            }
+/// Number of rows sampled to infer a Cypher-passthrough schema. Enough to observe
+/// mixed Int/Double columns and skip leading NULLs, cheap enough for a probe.
+const SCHEMA_SAMPLE_ROWS: usize = 200;
+
+/// A merge-able type inferred from sampled JSON values, so a column's type is a
+/// function of ALL sampled rows, not just the first one.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InferredType {
+    Bool,
+    Int,
+    Float,
+    Str,
+}
+
+impl InferredType {
+    /// Classify one non-null JSON value. Strings, arrays and objects (nodes,
+    /// relationships, lists, maps, temporals rendered as text) all map to `Str`,
+    /// which the row builder stringifies losslessly.
+    fn from_value(v: &Value) -> Self {
+        match v {
+            Value::Bool(_) => Self::Bool,
+            Value::Number(n) if n.is_i64() || n.is_u64() => Self::Int,
+            Value::Number(_) => Self::Float,
+            _ => Self::Str,
         }
-        _ => "String",
+    }
+
+    /// Combine two observed types for the same column. Identical types stay put;
+    /// Int+Float widen to Float; anything else falls back to Str (never loses data,
+    /// since Str stringifies). This is what makes the inferred schema stable across
+    /// rows and runs.
+    fn merge(self, other: Self) -> Self {
+        use InferredType::{Float, Int};
+        match (self, other) {
+            (a, b) if a == b => a,
+            (Int, Float) | (Float, Int) => Float,
+            _ => Self::Str,
+        }
+    }
+
+    fn neo4j_name(self) -> &'static str {
+        match self {
+            Self::Bool => "Boolean",
+            Self::Int => "Long",
+            Self::Float => "Double",
+            Self::Str => "String",
+        }
     }
 }
 
@@ -361,6 +409,22 @@ mod tests {
     use super::*;
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[test]
+    fn inferred_type_merge_is_order_independent_and_widens() {
+        use serde_json::json;
+        let it = InferredType::from_value;
+        // Int then Float, and Float then Int, both widen to Double (no data lost).
+        assert_eq!(it(&json!(1)).merge(it(&json!(2.5))).neo4j_name(), "Double");
+        assert_eq!(it(&json!(2.5)).merge(it(&json!(1))).neo4j_name(), "Double");
+        // Same type is stable.
+        assert_eq!(it(&json!(1)).merge(it(&json!(2))).neo4j_name(), "Long");
+        assert_eq!(it(&json!(true)).merge(it(&json!(false))).neo4j_name(), "Boolean");
+        // Incompatible mix (number + string, or a node/list) collapses to String.
+        assert_eq!(it(&json!(1)).merge(it(&json!("x"))).neo4j_name(), "String");
+        assert_eq!(it(&json!({"a":1})).neo4j_name(), "String");
+        assert_eq!(it(&json!([1, 2])).neo4j_name(), "String");
+    }
 
     fn conn(uri: &str, auth: Option<(&str, &str)>, max_retries: u32) -> Neo4jConnection {
         let hostport = uri.strip_prefix("http://").unwrap();
