@@ -51,7 +51,11 @@ pub(crate) const TEXT_EMBED_3_SMALL: &str = "text-embedding-3-small";
 pub const DEFAULT_EMBEDDING_MODEL: &str = TEXT_EMBED_3_SMALL;
 
 fn default_retry_strategy() -> FibonacciBackoff {
-    FibonacciBackoffBuilder::new().max_retries(Some(10)).build()
+    // 2 (not 10): a flaky/slow embedder gateway should fail fast, not hang for
+    // minutes retrying with growing backoff (which turned a bad gateway into an
+    // apparent engine wedge). Fewer retries pairs with the container
+    // healthcheck+autoheal that restarts a genuinely-wedged engine.
+    FibonacciBackoffBuilder::new().max_retries(Some(2)).build()
 }
 
 /// Embedding implementation for `OpenAI` compatible embedding models.
