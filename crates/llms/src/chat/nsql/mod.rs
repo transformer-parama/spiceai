@@ -29,6 +29,22 @@ pub struct QueryGenerationContext {
     /// prompt tells the model it may use `vector_search(<table>, '<text>', <k>)`
     /// for semantic-similarity questions instead of `LIKE`.
     pub semantic_search_tables: Vec<String>,
+    /// Name of a registered reranker model, if any. When set alongside
+    /// `semantic_search_tables`, the prompt tells the model it may wrap
+    /// `vector_search` in `rerank(...)` for higher-precision passage ranking.
+    pub reranker: Option<String>,
+    /// Datasets backed by the Neo4j connector. When non-empty, the prompt tells
+    /// the model it may retrieve graph rows with the `graph_query('<dataset>',
+    /// '<cypher>')` table function (mirrors `semantic_search_tables`, one
+    /// connector over). The engine auto-populates this from the registered
+    /// datasets whose source is `neo4j:`.
+    pub graph_datasets: Vec<String>,
+    /// Optional deployment-provided description of the graph's shape (scope
+    /// label, anchor/label/relationship conventions, fulltext index name).
+    /// The engine itself is ontology-agnostic, so this domain knowledge is
+    /// injected by the operator (env `SPICE_NSQL_GRAPH_HINT`) and appended
+    /// verbatim to the knowledge-graph prompt block when `graph_datasets` is set.
+    pub graph_hint: Option<String>,
 }
 
 pub struct FailedAttempt {
@@ -86,6 +102,33 @@ pub fn create_prompt(query: &str, ctx: &QueryGenerationContext) -> String {
             prompt,
             "\n\nSemantic search: these tables support vector similarity search over text: {tables}. The ONLY way to do ANY semantic / similarity / relevance / \"about\" / \"related to\" / passage-retrieval search is the `vector_search` table function — NO other similarity, ranking, full-text, or vector function, operator, or type exists in this engine. Do NOT use LIKE. Do NOT invent or call ANY of the following (NONE exist here and the query WILL fail): vector_search look-alikes (pg_vector_search, semantic_search, similarity_search, similarity_to_query, match), similarity/ranking functions (SIMILARITY, similarity, cosine_similarity, l2_distance, bm25_rank, ts_rank, ts_rank_cd), full-text functions (to_tsvector, to_tsquery, plainto_tsquery, websearch_to_tsquery), the pgvector distance operators (`<->`, `<=>`, `<#>`), or a `vector` type / `::vector` cast / vector literal. For ANY semantically-similar / about / relevant-to / top-passages question, use ONLY the table function `vector_search`. CRITICAL RULES: (1) its FIRST argument is the table name written as a BARE, UNQUOTED identifier — never a quoted string. (2) Use LIMIT for top-k, never TOP. Example: SELECT _score, text FROM vector_search({example}, 'the search phrase', 5) ORDER BY _score DESC LIMIT 5. It returns a `_score` column (higher = more relevant) plus the table's columns. When a question asks for the top-k passages AND single-value facts from other tables, put vector_search in the FROM clause as the MAIN rows and add each other fact as its own scalar-subquery column, e.g. SELECT _score, text, (SELECT avg(age) FROM spice.public.other_table) AS avg_age FROM vector_search({example}, 'the search phrase', 5) ORDER BY _score DESC LIMIT 5. Do NOT place vector_search inside a scalar subquery."
         );
+
+        if let Some(reranker) = &ctx.reranker {
+            let _ = write!(
+                prompt,
+                "\n\nReranking for higher precision: a reranker named `{reranker}` is registered. For \"top-k\", \"most relevant\", \"best\", or passage-retrieval questions, prefer WRAPPING the vector_search call in the `rerank` table function: a cross-encoder reorders the hits and gives noticeably better ordering than raw vector scores. Retrieve MORE candidates in the inner vector_search (about 20-50) and keep the final k with the outer `limit =>`. Example: SELECT text, rerank_score FROM rerank(vector_search({example}, 'the search phrase', 30), document => text, model => '{reranker}', limit => 5). RULES: (1) the FIRST argument is the vector_search(...) call itself, with its bare, unquoted table name; (2) `document =>` must be the table's main free-text column shown in the schema (the passage/body/text column), written as a bare identifier and NOT a quoted string; (3) write `model => '{reranker}'` exactly; (4) `limit =>` is how many final rows to keep; (5) the output is the table's columns (minus the raw score) plus a `rerank_score` column, ALREADY ordered best-first, so add NO ORDER BY; (6) never place rerank inside a scalar subquery. Plain vector_search without rerank is still acceptable when reranking is unnecessary."
+            );
+        }
+    }
+
+    // Knowledge-graph (Neo4j) injection — mirrors the vector_search block, one
+    // connector over. Names the graph datasets and teaches the `graph_query`
+    // table function so the model can traverse the graph in the SAME federated
+    // SQL as vector_search. The ontology (labels, anchors, scope) is deployment-
+    // specific, so it is supplied verbatim via `graph_hint` rather than baked in.
+    if !ctx.graph_datasets.is_empty() {
+        let datasets = ctx.graph_datasets.join(", ");
+        let first = ctx
+            .graph_datasets
+            .first()
+            .map_or("graph", String::as_str);
+        let _ = write!(
+            prompt,
+            "\n\nKnowledge graph: these datasets are Neo4j property graphs, queryable ONLY through the `graph_query` table function: {datasets}. Use it to retrieve entity-anchored facts and the text of related nodes. RULES: (1) call it in the FROM clause as graph_query('<dataset>', '<cypher>') where the FIRST argument is the dataset name written EXACTLY as shown, as a quoted string; (2) the SECOND argument is ONE read-only Cypher statement — only MATCH / OPTIONAL MATCH / WHERE / WITH / RETURN / ORDER BY / LIMIT / CALL db.index.* are allowed; NEVER CREATE, MERGE, DELETE, SET, REMOVE, or DETACH; (3) the result columns are the Cypher RETURN aliases — select those aliases directly in the outer SQL (e.g. SELECT text FROM graph_query(...)), never write node.property at the SQL level; (4) to answer a question from BOTH the graph and the passages, UNION ALL a graph_query(...) with a rerank(vector_search(...)) and give each side a literal `source` column. Minimal example: SELECT text FROM graph_query('{first}', 'MATCH (n) RETURN n.content AS text LIMIT 10')."
+        );
+        if let Some(hint) = &ctx.graph_hint {
+            let _ = write!(prompt, " GRAPH SHAPE (use these exact conventions): {hint}");
+        }
     }
 
     prompt
@@ -210,10 +253,106 @@ mod tests {
                 "syntax error near TOP".to_string(),
             )],
             semantic_search_tables: vec!["ihi_search".to_string()],
+            ..Default::default()
         };
         let prompt = create_prompt("q", &ctx);
         assert!(prompt.contains("syntax error near TOP")); // failed-attempt feedback
         assert!(prompt.contains("vector_search")); // and the semantic instruction
+    }
+
+    // --- rerank prompt injection ---------------------------------------------
+    // When a reranker is registered AND there are semantic tables, `/v1/nsql`
+    // steers the model to wrap vector_search in rerank(...) for better ranking.
+
+    #[test]
+    fn prompt_injects_rerank_when_reranker_and_semantic_tables_present() {
+        let ctx = QueryGenerationContext {
+            semantic_search_tables: vec!["ihi_search".to_string()],
+            reranker: Some("reranker".to_string()),
+            ..Default::default()
+        };
+        let prompt = create_prompt("best passages about ED crowding", &ctx);
+        assert!(prompt.contains("Reranking for higher precision"));
+        // the worked example wraps vector_search in rerank with the reranker name
+        assert!(prompt.contains(
+            "rerank(vector_search(ihi_search, 'the search phrase', 30), document => text, model => 'reranker', limit => 5)"
+        ));
+        // the rerank output contract is documented
+        assert!(prompt.contains("rerank_score"));
+    }
+
+    #[test]
+    fn prompt_omits_rerank_when_no_reranker() {
+        // semantic tables but NO reranker -> vector_search yes, rerank no.
+        let ctx = QueryGenerationContext {
+            semantic_search_tables: vec!["ihi_search".to_string()],
+            ..Default::default()
+        };
+        let prompt = create_prompt("q", &ctx);
+        assert!(prompt.contains("vector_search"));
+        assert!(!prompt.contains("Reranking for higher precision"));
+        assert!(!prompt.contains("rerank("));
+    }
+
+    #[test]
+    fn prompt_omits_rerank_without_semantic_tables_even_if_reranker_set() {
+        // a reranker with no semantic tables -> no vector_search, no rerank.
+        let ctx = QueryGenerationContext {
+            reranker: Some("reranker".to_string()),
+            ..Default::default()
+        };
+        let prompt = create_prompt("q", &ctx);
+        assert!(!prompt.contains("Reranking for higher precision"));
+        assert!(!prompt.contains("rerank("));
+    }
+
+    // --- graph_query (knowledge graph) prompt injection ----------------------
+    // The engine populates `graph_datasets` from datasets whose source is
+    // `neo4j:`, so `/v1/nsql` instructs the model to emit `graph_query(...)`.
+    #[test]
+    fn prompt_omits_graph_query_without_graph_datasets() {
+        let prompt = create_prompt("q", &QueryGenerationContext::default());
+        assert!(!prompt.contains("graph_query"));
+        assert!(!prompt.contains("Knowledge graph"));
+    }
+
+    #[test]
+    fn prompt_injects_graph_query_with_dataset_name_and_readonly_guidance() {
+        let ctx = QueryGenerationContext {
+            graph_datasets: vec!["graph".to_string()],
+            ..Default::default()
+        };
+        let prompt = create_prompt("q", &ctx);
+        assert!(prompt.contains("Knowledge graph"));
+        assert!(prompt.contains("graph_query"));
+        // names the dataset and uses it in the worked example
+        assert!(prompt.contains("graph_query('graph',"));
+        // steers the model away from writes
+        assert!(prompt.contains("NEVER CREATE"));
+    }
+
+    #[test]
+    fn prompt_appends_graph_hint_when_present() {
+        let ctx = QueryGenerationContext {
+            graph_datasets: vec!["graph".to_string()],
+            graph_hint: Some("nodes carry :asst_x; anchors are (:Entity {canonical_name})".to_string()),
+            ..Default::default()
+        };
+        let prompt = create_prompt("q", &ctx);
+        assert!(prompt.contains("GRAPH SHAPE"));
+        assert!(prompt.contains(":Entity {canonical_name}"));
+    }
+
+    #[test]
+    fn prompt_omits_graph_hint_without_graph_datasets() {
+        // a hint with no graph datasets -> no graph block at all.
+        let ctx = QueryGenerationContext {
+            graph_hint: Some("some shape".to_string()),
+            ..Default::default()
+        };
+        let prompt = create_prompt("q", &ctx);
+        assert!(!prompt.contains("Knowledge graph"));
+        assert!(!prompt.contains("GRAPH SHAPE"));
     }
 
     #[test]

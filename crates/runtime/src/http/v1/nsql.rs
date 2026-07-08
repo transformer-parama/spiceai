@@ -658,6 +658,31 @@ pub(crate) async fn handle_nsql_query(
         .await
         .map(|tbls| tbls.iter().map(std::string::ToString::to_string).collect())
         .unwrap_or_default();
+    // If semantic tables exist AND a reranker is registered, tell the model it
+    // may wrap vector_search in rerank(...) for higher-precision passage ranking.
+    if !sql_gen_ctx.semantic_search_tables.is_empty() {
+        let rerankers = rt.rerankers();
+        let guard = rerankers.read().await;
+        sql_gen_ctx.reranker = guard.keys().next().cloned();
+    }
+    // Tell the model which datasets are Neo4j graphs (queryable via
+    // graph_query(...)), so it can traverse the graph in the same federated SQL
+    // as vector_search. Auto-detected from datasets whose source is `neo4j:`.
+    // The graph's ontology is deployment-specific, so an optional operator hint
+    // (SPICE_NSQL_GRAPH_HINT) supplies the labels/anchors/scope conventions.
+    if let Some(app) = rt.read_app().await {
+        sql_gen_ctx.graph_datasets = app
+            .datasets
+            .iter()
+            .filter(|d| d.from.starts_with("neo4j:"))
+            .map(|d| d.name.clone())
+            .collect();
+    }
+    if !sql_gen_ctx.graph_datasets.is_empty() {
+        sql_gen_ctx.graph_hint = std::env::var("SPICE_NSQL_GRAPH_HINT")
+            .ok()
+            .filter(|s| !s.trim().is_empty());
+    }
     let max_retries = nsql_max_retries();
     let mut num_retries = 0;
 
