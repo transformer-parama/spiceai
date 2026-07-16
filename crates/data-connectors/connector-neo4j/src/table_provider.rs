@@ -229,6 +229,14 @@ impl CypherTableProvider {
     pub fn new(conn: Arc<Neo4jConnection>, cypher: String, schema: SchemaRef) -> Self {
         Self { conn, cypher, schema }
     }
+
+    /// Borrow this dataset's Neo4j connection (used by the `graph_query` UDTF so a
+    /// Cypher-mode neo4j dataset can serve as the connection anchor, not just a
+    /// label-mode [`Neo4jTableProvider`]).
+    #[must_use]
+    pub fn connection(&self) -> Arc<Neo4jConnection> {
+        Arc::clone(&self.conn)
+    }
 }
 
 #[async_trait]

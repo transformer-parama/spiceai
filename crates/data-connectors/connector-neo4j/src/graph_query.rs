@@ -108,11 +108,32 @@ fn blank_string_literals(cypher: &str) -> String {
     out
 }
 
+/// APOC (and other) procedure NAMESPACES that can execute an arbitrary Cypher string
+/// or mutate the graph even when the visible clause is a read. Because
+/// [`blank_string_literals`] erases the contents of quoted arguments before scanning,
+/// a smuggled write like `apoc.cypher.doIt('CREATE (n)')` would otherwise pass the
+/// [`WRITE_KEYWORDS`] check (the `CREATE` lives inside the blanked literal). These
+/// dotted prefixes survive blanking (they are syntax, not literals) and are matched
+/// against the blanked text so a write-forwarding call is rejected outright. Matched
+/// case-insensitively as substrings; the leading `.`-free property access `n.apoc`
+/// can't match because every entry contains an interior dot.
+const BLOCKED_PROC_NAMESPACES: &[&str] = &[
+    "apoc.cypher.",   // doIt / runWrite / runMany / mapParallel — run arbitrary strings
+    "apoc.periodic.", // iterate / commit / submit — background writes
+    "apoc.atomic.",   // atomic write helpers
+    "apoc.refactor.", // graph-refactoring writes
+    "apoc.trigger.",  // installs triggers (persistent writes)
+    "apoc.systemdb.", // system database access
+    "apoc.load.",     // external data load (LOAD-equivalent)
+];
+
 /// Reject Cypher containing a write/DDL clause. Tokenises on non-identifier characters
 /// so `set_value`/`created_at` are single tokens that do NOT match `SET`/`CREATE`, while
 /// `apoc.create` -> [`apoc`,`create`] IS caught. String-literal contents are blanked
 /// first (see [`blank_string_literals`]), so a write keyword appearing inside quoted
-/// user text is NOT a false positive — only Cypher syntax is scanned.
+/// user text is NOT a false positive — only Cypher syntax is scanned. A second pass
+/// rejects write-forwarding procedure namespaces (see [`BLOCKED_PROC_NAMESPACES`]) that
+/// keyword scanning alone can't catch once their string argument is blanked.
 fn ensure_read_only(cypher: &str) -> Result<()> {
     let scannable = blank_string_literals(cypher);
     for token in scannable.split(|c: char| !(c.is_alphanumeric() || c == '_')) {
@@ -124,6 +145,12 @@ fn ensure_read_only(cypher: &str) -> Result<()> {
                 "{GRAPH_QUERY_UDTF_NAME}(): only read-only Cypher is allowed; found write clause '{token}'"
             )));
         }
+    }
+    let lowered = scannable.to_ascii_lowercase();
+    if let Some(ns) = BLOCKED_PROC_NAMESPACES.iter().find(|ns| lowered.contains(*ns)) {
+        return Err(DataFusionError::Plan(format!(
+            "{GRAPH_QUERY_UDTF_NAME}(): only read-only Cypher is allowed; procedure namespace '{ns}' is not permitted"
+        )));
     }
     Ok(())
 }
@@ -169,16 +196,23 @@ impl TableFunctionImpl for GraphQueryTableFunc {
             })?;
 
         // A registered dataset's provider is wrapped (metadata / federation adaptor),
-        // so unwrap to the concrete Neo4jTableProvider to borrow its connection.
-        let neo = runtime::search::util::find_concrete_table_provider::<Neo4jTableProvider>(
+        // so unwrap to the concrete neo4j provider to borrow its connection. Either
+        // mode is a valid anchor: label-mode (`Neo4jTableProvider`) or Cypher-mode
+        // (`CypherTableProvider`) -- graph_query only needs the connection, not the
+        // dataset's own schema/query.
+        let conn = runtime::search::util::find_concrete_table_provider::<Neo4jTableProvider>(
             &provider,
         )
+        .map(Neo4jTableProvider::connection)
+        .or_else(|| {
+            runtime::search::util::find_concrete_table_provider::<CypherTableProvider>(&provider)
+                .map(CypherTableProvider::connection)
+        })
         .ok_or_else(|| {
             DataFusionError::Plan(format!(
                 "{GRAPH_QUERY_UDTF_NAME}(): dataset '{dataset}' is not a neo4j dataset"
             ))
         })?;
-        let conn = neo.connection();
 
         // Cache key is per (dataset, wrapped-cypher): the same call reuses the schema
         // and skips the describe-probe (which re-runs the traversal). NUL separates the
@@ -287,6 +321,35 @@ mod tests {
             "LOAD CSV FROM 'file:///x.csv' AS row RETURN row",
         ] {
             assert!(ensure_read_only(q).is_err(), "should be rejected: {q}");
+        }
+    }
+
+    #[test]
+    fn read_only_rejects_write_forwarding_procedures() {
+        // Write hidden inside a blanked string literal, forwarded by a procedure that
+        // executes it — the WRITE_KEYWORDS pass can't see it, the namespace pass must.
+        for q in [
+            "CALL apoc.cypher.doIt('CREATE (n:X)', {}) YIELD value RETURN value",
+            "CALL apoc.cypher.runWrite('MATCH (n) DELETE n', {}) YIELD value RETURN value",
+            "CALL apoc.periodic.iterate('MATCH (n) RETURN n', 'DELETE n', {}) YIELD batches RETURN batches",
+            "CALL apoc.refactor.mergeNodes([]) YIELD node RETURN node",
+            "CALL apoc.trigger.add('t', 'RETURN 1', {}) YIELD name RETURN name",
+            "CALL apoc.load.json('http://evil/x.json') YIELD value RETURN value",
+        ] {
+            assert!(ensure_read_only(q).is_err(), "write-forwarding proc must be rejected: {q}");
+        }
+    }
+
+    #[test]
+    fn read_only_still_allows_safe_apoc_and_similar_names() {
+        // Read-only APOC procedures and property/identifier names that merely contain
+        // "apoc" must NOT be blocked — the denylist requires an interior dot.
+        for q in [
+            "CALL apoc.coll.sort([3,1,2]) YIELD value RETURN value",
+            "MATCH (n) WHERE n.apoc_flag = true RETURN n.name",
+            "MATCH (n {note: 'call apoc.cypher.doIt to migrate'}) RETURN n.name",
+        ] {
+            assert!(ensure_read_only(q).is_ok(), "safe query must not be blocked: {q}");
         }
     }
 

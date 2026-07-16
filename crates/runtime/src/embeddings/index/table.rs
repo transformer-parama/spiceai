@@ -214,13 +214,36 @@ async fn wrap_table_as_index_milvus(
         .collect();
 
     let inner_schema = inner_table_provider.schema();
-    let mut provider = if let Some(indexed) = inner_table_provider
+
+    // Milvus-only: the base IS the Milvus connector (detectable by its
+    // `query_vector` input column). The widened index (see milvus::try_from_table)
+    // returns every column, so this base is never actually scanned — but its
+    // schema still unions into the search provider's advertised schema. Present a
+    // CLEAN schema-only base (EmptyTable) with just the data columns, so the
+    // connector's `query_vector`/`score` pseudo-columns don't pollute the output
+    // (which would also break `SELECT *` by forcing a join the connector cannot
+    // serve). Non-Milvus bases (Postgres/Iceberg) are used as-is for join-back.
+    let base_provider: Arc<dyn TableProvider> =
+        if inner_schema.column_with_name("query_vector").is_some() {
+            let clean_fields: Vec<arrow_schema::Field> = inner_schema
+                .fields()
+                .iter()
+                .filter(|f| f.name() != "query_vector" && f.name() != "score")
+                .map(|f| f.as_ref().clone())
+                .collect();
+            let clean_schema = Arc::new(arrow_schema::Schema::new(clean_fields));
+            Arc::new(datafusion::datasource::empty::EmptyTable::new(clean_schema))
+        } else {
+            Arc::clone(&inner_table_provider)
+        };
+
+    let mut provider = if let Some(indexed) = base_provider
         .as_any()
         .downcast_ref::<IndexedTableProvider>()
     {
         indexed.clone()
     } else {
-        IndexedTableProvider::new(Arc::clone(&inner_table_provider))
+        IndexedTableProvider::new(Arc::clone(&base_provider))
     };
 
     for (column, config) in embedding_columns {

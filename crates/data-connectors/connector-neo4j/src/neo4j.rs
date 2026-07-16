@@ -28,6 +28,7 @@ limitations under the License.
 //! so the connector builds its Arrow schema dynamically. OpenTelemetry metrics
 //! are emitted under the `connector_neo4j` meter.
 
+use std::collections::HashMap;
 use std::sync::LazyLock;
 use std::time::Duration;
 
@@ -205,27 +206,57 @@ impl Neo4jConnection {
     /// Introspect a node label's properties so the connector can build its Arrow
     /// schema dynamically. Doubles as a reachability/existence check at dataset
     /// registration. Uses the built-in `db.schema.nodeTypeProperties()`.
+    ///
+    /// `db.schema.nodeTypeProperties()` reports one row per *node-label combination*,
+    /// not per label. A node that carries several labels (e.g. GraphRAG's
+    /// `:Entity:asst_xyz:performance_metric`) makes the same property (`id`, `name`,
+    /// …) appear once for EVERY combination the target label participates in. So the
+    /// results are de-duplicated by property name here — otherwise the Arrow schema
+    /// would hold duplicate fields and every generated `RETURN n.id AS id, …, n.id AS
+    /// id` would be rejected by Neo4j ("Multiple result columns with the same name").
+    /// When a property is seen with more than one type (across combinations, or a
+    /// multi-type `propertyTypes` array), the types are MERGED the same way sampled
+    /// values are in [`describe_cypher`]: Int+Float widen to Double, anything else
+    /// falls back to String (lossless, since the row builder stringifies). Insertion
+    /// order of first appearance is preserved for a stable column order.
     pub async fn describe_label(&self, label: &str) -> Result<Vec<PropertyField>, Neo4jError> {
         let cypher = "CALL db.schema.nodeTypeProperties() \
                       YIELD nodeLabels, propertyName, propertyTypes \
                       WHERE $label IN nodeLabels \
                       RETURN propertyName, propertyTypes";
         let rows = self.run_query(cypher, json!({ "label": label })).await?;
-        let mut out = Vec::with_capacity(rows.len());
+        let mut order: Vec<String> = Vec::new();
+        let mut merged: HashMap<String, InferredType> = HashMap::new();
         for row in rows {
             let Some(name) = row.get("propertyName").and_then(Value::as_str) else {
                 continue;
             };
-            let type_name = row
+            // Merge across every type listed for this row (a property may be reported
+            // with more than one concrete type), defaulting to String when absent.
+            let row_type = row
                 .get("propertyTypes")
                 .and_then(Value::as_array)
-                .and_then(|a| a.first())
-                .and_then(Value::as_str)
-                .unwrap_or("String")
-                .to_string();
-            out.push(PropertyField { name: name.to_string(), type_name });
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(InferredType::from_neo4j_name)
+                .reduce(InferredType::merge)
+                .unwrap_or(InferredType::Str);
+            merged
+                .entry(name.to_string())
+                .and_modify(|t| *t = t.merge(row_type))
+                .or_insert_with(|| {
+                    order.push(name.to_string());
+                    row_type
+                });
         }
-        Ok(out)
+        Ok(order
+            .into_iter()
+            .map(|name| {
+                let type_name = merged[&name].neo4j_name().to_string();
+                PropertyField { name, type_name }
+            })
+            .collect())
     }
 
     /// Run a Cypher statement and return the rows as name->value maps.
@@ -270,7 +301,10 @@ impl Neo4jConnection {
     /// A column with no non-null sample (empty result, or all-null) defaults to
     /// String — the lossless fallback, since the row builder stringifies anything.
     pub async fn describe_cypher(&self, cypher: &str) -> Result<Vec<PropertyField>, Neo4jError> {
-        let probe = format!("CALL {{ {cypher} }} RETURN * LIMIT {SCHEMA_SAMPLE_ROWS}");
+        // Strip a trailing statement separator: it is legal in a bare statement but
+        // becomes a syntax error once the Cypher is embedded inside `CALL { ... }`.
+        let inner = cypher.trim().trim_end_matches(';').trim();
+        let probe = format!("CALL {{ {inner} }} RETURN * LIMIT {SCHEMA_SAMPLE_ROWS}");
         let (cols, rows) = self.run_query_cols(&probe, Value::Null).await?;
         Ok(cols
             .into_iter()
@@ -377,6 +411,20 @@ impl InferredType {
             Value::Bool(_) => Self::Bool,
             Value::Number(n) if n.is_i64() || n.is_u64() => Self::Int,
             Value::Number(_) => Self::Float,
+            _ => Self::Str,
+        }
+    }
+
+    /// Classify a Neo4j *type name* (from `db.schema.nodeTypeProperties`) into the
+    /// same buckets as sampled values, so label-mode schema inference merges types
+    /// identically to Cypher-mode. Kept in lock-step with `exec::arrow_type_for`:
+    /// only scalar numeric/boolean types get a native bucket; everything else
+    /// (String, DateTime, Point, lists, …) is `Str` and rendered as text.
+    fn from_neo4j_name(name: &str) -> Self {
+        match name {
+            "Long" | "Integer" => Self::Int,
+            "Double" | "Float" => Self::Float,
+            "Boolean" => Self::Bool,
             _ => Self::Str,
         }
     }
@@ -549,6 +597,44 @@ mod tests {
         assert_eq!(props[0].type_name, "String");
         assert_eq!(props[1].name, "age");
         assert_eq!(props[1].type_name, "Long");
+    }
+
+    #[tokio::test]
+    async fn describe_label_dedupes_multi_label_properties_and_merges_types() {
+        // Real GraphRAG shape: `Entity` nodes also carry a per-tenant label and a
+        // per-type label, so db.schema.nodeTypeProperties() reports the SAME property
+        // once per label-combination. describe_label must collapse those to one field
+        // each (else the generated RETURN has duplicate aliases and Neo4j rejects it),
+        // and merge a property seen as both Long and Double into Double.
+        let s = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/db/neo4j/tx/commit"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "results": [{
+                    "columns": ["propertyName", "propertyTypes"],
+                    "data": [
+                        {"row": ["id", ["String"]]},
+                        {"row": ["name", ["String"]]},
+                        {"row": ["frequency", ["Long"]]},
+                        // second label-combination: same props repeated ...
+                        {"row": ["id", ["String"]]},
+                        {"row": ["name", ["String"]]},
+                        // ... but `frequency` observed as Double here -> widen
+                        {"row": ["frequency", ["Double"]]},
+                        {"row": ["created_at", ["DateTime"]]}
+                    ]
+                }],
+                "errors": []
+            })))
+            .mount(&s)
+            .await;
+        let props = conn(&s.uri(), None, 0).describe_label("Entity").await.unwrap();
+        // Four distinct columns, first-seen order preserved.
+        let names: Vec<&str> = props.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, vec!["id", "name", "frequency", "created_at"]);
+        // Long + Double widened to Double; DateTime falls back to String.
+        assert_eq!(props[2].type_name, "Double");
+        assert_eq!(props[3].type_name, "String");
     }
 
     #[tokio::test]

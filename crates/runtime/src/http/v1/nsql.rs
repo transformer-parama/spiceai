@@ -211,27 +211,45 @@ async fn sample_messages(
         .map(|params| {
             let rt = Arc::clone(&rt);
             let allowlist = table_allowlist.clone();
+            let tbl = dataset.to_string();
             async move {
                 let method = SampleTableMethod::from(&params);
-                create_tool_use_messages(
+                let res = create_tool_use_messages(
                     &SampleDataTool::new(rt.datafusion(), method.clone())
                         .with_table_allowlist(allowlist),
                     format!("sample-{method:?}").as_str(),
                     &params,
                 )
                 .instrument(Span::current())
-                .await
+                .await;
+                (tbl, method, res)
             }
         })
     });
 
-    let tool_call_messages = futures::stream::iter(message_futures)
+    // Best-effort, PER TABLE: a table that cannot be sampled (unscannable connector,
+    // a permission error, a transient store failure) must not fail the whole request.
+    // This previously used `try_collect`, which propagates the first error and makes
+    // the caller return 500 — so ONE bad dataset blocked EVERY natural-language query,
+    // including ones that never touch it. Sampling is an optional context enrichment,
+    // so a failure just drops that table's sample and is logged.
+    let results = futures::stream::iter(message_futures)
         .boxed()
         .buffer_unordered(DATA_SAMPLING_MAX_CONCURRENT)
-        .try_collect::<Vec<_>>()
-        .await?;
+        .collect::<Vec<_>>()
+        .await;
 
-    Ok(tool_call_messages.into_iter().flatten().collect())
+    let mut messages = Vec::new();
+    for (tbl, method, res) in results {
+        match res {
+            Ok(msgs) => messages.extend(msgs),
+            Err(e) => tracing::warn!(
+                "NSQL sampling skipped for {tbl} ({method:?}): {e}. \
+                 Continuing without a sample for this table."
+            ),
+        }
+    }
+    Ok(messages)
 }
 
 // Default TTL for the NSQL schema/sample message cache. The schema (`table_schema`)
@@ -353,7 +371,9 @@ pub struct Request {
     #[serde(default)]
     pub stream: bool,
 
-    /// Whether sample data is included in the context for SQL generation. Default: false
+    /// Whether sample data (per-column DISTINCT values + a random row sample) is
+    /// included in the context for SQL generation. Default: true — real values are
+    /// what stop the model inventing filters/joins that parse but match nothing.
     #[serde(default = "default_sample_data_enabled")]
     pub sample_data_enabled: bool,
 
@@ -366,8 +386,15 @@ pub struct Request {
     pub prompt_cache_key: Option<String>,
 }
 
+/// Sample data is ON by default. Schema alone tells the model a column exists but not
+/// what it CONTAINS, so it guesses literals/joins that parse yet match nothing (and
+/// then burns retries). The per-request cost that made this default-off is gone: the
+/// DISTINCT+random fan-out is now behind a single-flight TTL cache
+/// (`NSQL_SAMPLE_CACHE`), so it runs once per (model, table-set) per TTL rather than
+/// on every request. Callers can still opt out per request with
+/// `"sample_data_enabled": false`.
 fn default_sample_data_enabled() -> bool {
-    false
+    true
 }
 
 /// Checks if the request is asking to only generate SQL.
@@ -600,6 +627,19 @@ pub(crate) async fn handle_nsql_query(
                 .collect(),
         );
 
+    // Datasets that are search-only (Milvus): they serve vector_search but cannot serve
+    // a plain scan. Resolved once here because it is needed BOTH to filter sampling
+    // (just below) and to build the prompt block further down.
+    let search_only_tables: Vec<String> = match rt.read_app().await {
+        Some(app) => app
+            .datasets
+            .iter()
+            .filter(|d| d.from.starts_with("milvus:"))
+            .map(|d| d.name.clone())
+            .collect(),
+        None => Vec::new(),
+    };
+
     // Assistant/tool messages for the `table_schema` tool over all/provided tables.
     // Cached by (model, table set) with a TTL so the schema fan-out isn't re-run on
     // every request; see NSQL_SAMPLE_CACHE.
@@ -619,11 +659,33 @@ pub(crate) async fn handle_nsql_query(
         }
     };
 
-    // Same for the (much heavier) data-sampling messages, only when requested. These
-    // are the ~1-query-per-column DISTINCT + random-sample fan-out across every table.
-    let sample_data_messages = if sample_data_enabled {
-        match cached_sample_messages(&rt, &model, &tables, table_allowlist_opt.as_ref(), &span)
-            .await
+    // Same for the (much heavier) data-sampling messages. These are the ~1-query-per-
+    // column DISTINCT + random-sample fan-out, cached per (model, table set) per TTL.
+    //
+    // Search-only (Milvus) tables are excluded: a scan of them yields no rows, so
+    // sampling would spend two queries per table to produce an EMPTY sample block —
+    // which reads to the model as "this table has no data" and directly contradicts
+    // the search-only instruction telling it to use vector_search. Better to send no
+    // sample for them than a misleading empty one.
+    let sample_tables: Vec<TableReference> = tables
+        .iter()
+        .filter(|t| {
+            !search_only_tables
+                .iter()
+                .any(|s| TableReference::parse_str(s).table() == t.table())
+        })
+        .cloned()
+        .collect();
+
+    let sample_data_messages = if sample_data_enabled && !sample_tables.is_empty() {
+        match cached_sample_messages(
+            &rt,
+            &model,
+            &sample_tables,
+            table_allowlist_opt.as_ref(),
+            &span,
+        )
+        .await
         {
             Ok(m) => m,
             Err(e) => {
@@ -678,6 +740,11 @@ pub(crate) async fn handle_nsql_query(
             .map(|d| d.name.clone())
             .collect();
     }
+    // Milvus datasets are search-only: a plain scan returns zero rows instead of
+    // erroring, so without naming them the model emits `SELECT count(*) FROM <milvus
+    // table>` and reports the resulting 0 as a real answer. Resolved above (it also
+    // filters sampling).
+    sql_gen_ctx.search_only_tables = search_only_tables;
     if !sql_gen_ctx.graph_datasets.is_empty() {
         sql_gen_ctx.graph_hint = std::env::var("SPICE_NSQL_GRAPH_HINT")
             .ok()
