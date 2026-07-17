@@ -127,20 +127,38 @@ pub async fn get_table_elements(
         return vec![];
     };
 
-    app.datasets
-        .iter()
-        .filter(|&d| {
-            opt_include.is_none_or(|ts| ts.table_is_allowed(&TableReference::parse_str(&d.name)))
-        })
-        .map(|d| ListDatasetElement {
+    let mut out = Vec::new();
+    for d in app.datasets.iter().filter(|&d| {
+        opt_include.is_none_or(|ts| ts.table_is_allowed(&TableReference::parse_str(&d.name)))
+    }) {
+        let mut metadata = d.metadata.clone();
+        // Neo4j datasets expose only ONE node label as a table, and the entity /
+        // relationship type VALUES are unguessable (extracted per-corpus). Attach the
+        // graph's tenant-scoped ontology so a single list_datasets call gives a client
+        // everything it needs to write correct Cypher.
+        if let Some(gs) = super::graph_discovery::neo4j_graph_schema(&rt, &d.from, &d.name).await {
+            metadata.insert("node_labels".to_string(), serde_json::json!(gs.node_labels));
+            metadata.insert(
+                "relationship_types".to_string(),
+                serde_json::json!(gs.relationship_types),
+            );
+            // subject -[rel]-> object over label sets: says which labels actually
+            // connect via which relationship (entity types ARE labels, so they need
+            // no special handling).
+            if !gs.ontology.is_empty() {
+                metadata.insert("ontology".to_string(), serde_json::json!(gs.ontology));
+            }
+        }
+        out.push(ListDatasetElement {
             table: TableReference::parse_str(&d.name)
                 .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
                 .to_string(),
             can_search_documents: d.has_embeddings(),
             description: d.description.clone(),
-            metadata: d.metadata.clone(),
-        })
-        .collect_vec()
+            metadata,
+        });
+    }
+    out
 }
 
 pub async fn get_catalog_elements(

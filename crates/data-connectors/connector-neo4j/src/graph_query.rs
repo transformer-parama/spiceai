@@ -179,6 +179,17 @@ impl TableFunctionImpl for GraphQueryTableFunc {
 
         // Safety: read-only only, and cap the row count.
         ensure_read_only(&cypher)?;
+
+        // Per-tenant isolation (fail-closed): when a scope label is configured, inject
+        // it into every node pattern and reject Cypher that could escape the tenant.
+        // Must run on the RAW cypher, BEFORE the `CALL { ... }` row-cap wrap (which
+        // would otherwise trip the no-CALL rule). No scope configured -> unchanged.
+        let cypher = match crate::scope::scope_label_from_env() {
+            Some(scope) => crate::scope::enforce_scope(&cypher, &scope)
+                .map_err(DataFusionError::Plan)?,
+            None => cypher,
+        };
+
         let cypher = with_row_cap(&cypher, max_rows());
 
         let df = self.df.upgrade().ok_or_else(|| {

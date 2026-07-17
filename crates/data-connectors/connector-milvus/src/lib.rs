@@ -57,6 +57,10 @@ pub struct MilvusConnector {
     metric: String,
     output_fields: Vec<String>,
     partition: Option<String>,
+    /// Fail-closed multi-tenant safety: when set, a collection is refused unless a
+    /// `partition` is configured, so an ANN search can never silently fall back to
+    /// scanning the whole (multi-tenant) collection. See [`require_partition`].
+    require_partition: bool,
 }
 
 impl std::fmt::Debug for MilvusConnector {
@@ -124,7 +128,26 @@ const PARAMETERS: &[ParameterSpec] = &[
         .description("Comma-separated scalar fields to return (default: all scalar fields)."),
     ParameterSpec::component("partition")
         .description("Optional Milvus partition to scope to (per-tenant isolation)."),
+    ParameterSpec::component("require_partition")
+        .description(
+            "Fail closed: refuse to register/search this collection unless `partition` \
+             is set. Prevents a missing partition from silently searching the whole \
+             (multi-tenant) collection. Also enabled process-wide by \
+             SPICE_MILVUS_REQUIRE_PARTITION=true.",
+        )
+        .default("false"),
 ];
+
+/// Whether a partition must be configured, from the per-connector `require_partition`
+/// param OR the process-wide `SPICE_MILVUS_REQUIRE_PARTITION` env (either enables it).
+/// Default is off so single-tenant / bring-your-own-data collections are unaffected.
+fn require_partition(param: bool) -> bool {
+    param
+        || matches!(
+            std::env::var("SPICE_MILVUS_REQUIRE_PARTITION").ok().as_deref(),
+            Some("true" | "1" | "yes")
+        )
+}
 
 impl DataConnectorFactory for MilvusFactory {
     fn as_any(&self) -> &dyn Any {
@@ -195,6 +218,7 @@ impl DataConnectorFactory for MilvusFactory {
                 metric: p("metric").unwrap_or_else(|| "COSINE".to_string()),
                 output_fields,
                 partition: p("partition"),
+                require_partition: require_partition(bool_flag("require_partition")),
             }) as Arc<dyn DataConnector>)
         })
     }
@@ -226,6 +250,16 @@ impl DataConnector for MilvusConnector {
             connector_component: ConnectorComponent::from(dataset),
             source: Box::<dyn std::error::Error + Send + Sync>::from(msg),
         };
+
+        // Fail closed: when partition is required but unset, refuse to register the
+        // collection. Without this, a missing partition makes every ANN search omit
+        // `partitionNames` and scan the ENTIRE (multi-tenant) collection silently.
+        if self.require_partition && self.partition.as_deref().unwrap_or("").is_empty() {
+            return Err(err(format!(
+                "collection '{collection}': require_partition is set but `milvus_partition` \
+                 is empty — refusing to serve an unscoped (whole-collection) search"
+            )));
+        }
 
         // Introspect the collection (also a reachability/existence check) and
         // build the Arrow schema dynamically -- works for ANY collection layout.

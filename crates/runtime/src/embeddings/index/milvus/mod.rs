@@ -47,6 +47,12 @@ pub(crate) const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("metric").description("Distance metric: COSINE | L2 | IP."),
     ParameterSpec::component("partition")
         .description("Optional Milvus partition to scope searches to (per-tenant isolation)."),
+    ParameterSpec::component("require_partition")
+        .description(
+            "Fail closed: refuse to build this vector index unless `partition` is set. \
+             Prevents a missing partition from silently searching the whole \
+             (multi-tenant) collection. Also enabled by SPICE_MILVUS_REQUIRE_PARTITION=true.",
+        ),
     ParameterSpec::component("token")
         .description("Bearer token (`username:password`, or an API key).")
         .secret(),
@@ -206,6 +212,23 @@ pub async fn try_from_table(
     // Optional per-tenant partition: scope every ANN search to this Milvus partition
     // (isolation for multi-assistant collections partitioned by assistant_id).
     let partition = string_from_params(&params, "partition").map(str::to_string);
+
+    // Fail closed: when partition is required (per-index param or the process-wide
+    // SPICE_MILVUS_REQUIRE_PARTITION env) but unset, refuse to build the index — this
+    // is the ONLY tenant boundary on the vector_search path (there is no scalar-filter
+    // fallback), so an unscoped search would leak every tenant's vectors.
+    let require_partition = bool_flag("require_partition")
+        || matches!(
+            std::env::var("SPICE_MILVUS_REQUIRE_PARTITION").ok().as_deref(),
+            Some("true" | "1" | "yes")
+        );
+    if require_partition && partition.as_deref().unwrap_or("").is_empty() {
+        return Err(Box::<dyn std::error::Error + Send + Sync>::from(format!(
+            "Milvus vector index for table '{ds_name}' requires `milvus_partition` \
+             (require_partition / SPICE_MILVUS_REQUIRE_PARTITION set) but it is empty — \
+             refusing to serve an unscoped (whole-collection) vector_search"
+        )));
+    }
 
     // Dimension: configured `vector_size`, else inferred from the model.
     let dimension: i32 = match config.vector_size {

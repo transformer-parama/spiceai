@@ -30,6 +30,7 @@ limitations under the License.
 mod exec;
 mod graph_query;
 mod neo4j;
+mod scope;
 mod table_provider;
 
 pub use graph_query::{GraphQueryTableFunc, GRAPH_QUERY_UDTF_NAME};
@@ -61,6 +62,12 @@ use crate::table_provider::{CypherTableProvider, Neo4jTableProvider};
 pub struct Neo4jConnector {
     conn: Arc<Neo4jConnection>,
     cypher: Option<String>,
+    /// Per-tenant scope label (e.g. `asst_42`). When set, a label-mode scan matches
+    /// `(n:<Label>:<scope>)` so a shared graph only exposes this tenant's nodes.
+    /// Resolved from the `neo4j_scope_label` param or the `SPICE_NEO4J_SCOPE_LABEL`
+    /// env (the same env also scopes the `graph_query` UDTF, so one setting isolates
+    /// both surfaces in the one-spiced-per-assistant deployment).
+    scope_label: Option<String>,
 }
 
 impl std::fmt::Debug for Neo4jConnector {
@@ -123,7 +130,23 @@ const PARAMETERS: &[ParameterSpec] = &[
              Cypher-passthrough incl. relationship traversals). When unset, the \
              dataset path is treated as a node label.",
         ),
+    ParameterSpec::component("scope_label")
+        .description(
+            "Per-tenant node label (e.g. `asst_42`). In label mode, scans match \
+             `(n:<Label>:<scope>)` so a shared graph only exposes this tenant's nodes. \
+             Falls back to the SPICE_NEO4J_SCOPE_LABEL env, which also scopes graph_query().",
+        ),
 ];
+
+/// Resolve the per-tenant scope label from the `neo4j_scope_label` param, falling back
+/// to the process-wide `SPICE_NEO4J_SCOPE_LABEL` env (so a single env isolates both
+/// label-mode scans and the graph_query UDTF). Empty/whitespace resolves to None.
+fn resolve_scope_label(param: Option<String>) -> Option<String> {
+    param
+        .or_else(|| std::env::var("SPICE_NEO4J_SCOPE_LABEL").ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
 
 impl DataConnectorFactory for Neo4jFactory {
     fn as_any(&self) -> &dyn Any {
@@ -177,7 +200,11 @@ impl DataConnectorFactory for Neo4jFactory {
             };
             let conn = Arc::new(Neo4jConnection::new(cfg).map_err(|e| connect_err(e.to_string()))?);
 
-            Ok(Arc::new(Neo4jConnector { conn, cypher: p("cypher") }) as Arc<dyn DataConnector>)
+            Ok(Arc::new(Neo4jConnector {
+                conn,
+                cypher: p("cypher"),
+                scope_label: resolve_scope_label(p("scope_label")),
+            }) as Arc<dyn DataConnector>)
         })
     }
 
@@ -249,8 +276,12 @@ impl DataConnector for Neo4jConnector {
             )));
         }
 
-        Ok(Arc::new(Neo4jTableProvider::new(Arc::clone(&self.conn), label, to_schema(&props)))
-            as Arc<dyn TableProvider>)
+        Ok(Arc::new(Neo4jTableProvider::new(
+            Arc::clone(&self.conn),
+            label,
+            to_schema(&props),
+            self.scope_label.clone(),
+        )) as Arc<dyn TableProvider>)
     }
 }
 

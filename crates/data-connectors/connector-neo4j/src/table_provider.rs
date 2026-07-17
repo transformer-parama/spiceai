@@ -45,13 +45,22 @@ pub struct Neo4jTableProvider {
     conn: Arc<Neo4jConnection>,
     label: String,
     schema: SchemaRef,
+    /// Per-tenant scope label injected into the MATCH as a second node label
+    /// (`(n:<label>:<scope>)`) so a shared graph only exposes this tenant's nodes.
+    scope_label: Option<String>,
 }
 
 impl Neo4jTableProvider {
     /// `schema` is built dynamically from the label's introspected properties
-    /// (see lib.rs): one typed column per property.
-    pub fn new(conn: Arc<Neo4jConnection>, label: String, schema: SchemaRef) -> Self {
-        Self { conn, label, schema }
+    /// (see lib.rs): one typed column per property. `scope_label`, when set, scopes
+    /// every scan to `(n:<label>:<scope>)` for per-tenant isolation on a shared graph.
+    pub fn new(
+        conn: Arc<Neo4jConnection>,
+        label: String,
+        schema: SchemaRef,
+        scope_label: Option<String>,
+    ) -> Self {
+        Self { conn, label, schema, scope_label }
     }
 
     /// Borrow this dataset's Neo4j connection (used by the `graph_query` UDTF to
@@ -196,9 +205,16 @@ impl TableProvider for Neo4jTableProvider {
             None => String::new(),
         };
 
+        // Per-tenant isolation: a configured scope label becomes a second required
+        // node label, so a shared graph only matches this tenant's nodes.
+        let label_pattern = match &self.scope_label {
+            Some(scope) => format!("{}:{}", cypher_ident(&self.label), cypher_ident(scope)),
+            None => cypher_ident(&self.label),
+        };
+
         let cypher = format!(
             "MATCH (n:{}){} {}{}",
-            cypher_ident(&self.label),
+            label_pattern,
             where_clause,
             return_clause,
             limit_clause

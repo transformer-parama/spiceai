@@ -142,6 +142,18 @@ async fn api_key_auth(secrets: &Secrets, api_key_auth: &SpicepodApiKeyAuth) -> A
         keys.push(key);
     }
 
+    // Fail-closed is already handled by `ApiKeyAuth` (empty keys are dropped and a
+    // zero-key auth denies every request). Surface that loudly at startup, otherwise
+    // a misconfigured/empty ENGINE_API_KEY looks like a mysterious "everything 401s"
+    // outage instead of an obvious config error.
+    if keys.iter().all(ApiKey::is_empty) {
+        tracing::error!(
+            "runtime.auth.api_key is enabled but no non-empty API key resolved \
+             (check ENGINE_API_KEY and the `keys:` env references). The engine will \
+             DENY every authenticated request until a key is configured."
+        );
+    }
+
     Arc::new(ApiKeyAuth::new(keys))
 }
 
