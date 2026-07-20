@@ -148,6 +148,14 @@ pub async fn get_table_elements(
             if !gs.ontology.is_empty() {
                 metadata.insert("ontology".to_string(), serde_json::json!(gs.ontology));
             }
+            // Per-label property keys, so a model writing Cypher selects real
+            // properties (e.g. `e.name`) instead of guessing `e.patient_id`.
+            if !gs.node_properties.is_empty() {
+                metadata.insert(
+                    "node_properties".to_string(),
+                    serde_json::json!(gs.node_properties),
+                );
+            }
         }
         out.push(ListDatasetElement {
             // Emit a QUOTED fully-qualified name (quotes only the parts that need

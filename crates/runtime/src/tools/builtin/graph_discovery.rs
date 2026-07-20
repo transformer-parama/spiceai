@@ -46,6 +46,7 @@ limitations under the License.
 //! `try_get_with` gives single-flight so concurrent first-calls hit Neo4j once.
 //! Discovery is best-effort: failures yield `None` and never break the listing.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, LazyLock};
 
 use arrow::array::{Array, RecordBatch, StringArray};
@@ -64,12 +65,23 @@ pub struct OntologyTriple {
     pub object: Vec<String>,
 }
 
+/// The property keys seen on nodes carrying a given label. Labels and relationship
+/// types are unguessable; so are PROPERTY keys — a model writing Cypher must be told
+/// which properties exist or it invents `patient_id` / `name` and gets nulls.
+#[derive(Clone, Debug, Serialize)]
+pub struct LabelProperties {
+    pub label: String,
+    pub properties: Vec<String>,
+}
+
 /// A Neo4j dataset's discovered graph ontology (scoped to the calling tenant).
 #[derive(Clone, Debug, Default)]
 pub struct GraphSchema {
     pub node_labels: Vec<String>,
     pub relationship_types: Vec<String>,
     pub ontology: Vec<OntologyTriple>,
+    /// Per-label property keys. Best-effort: empty if discovery failed.
+    pub node_properties: Vec<LabelProperties>,
 }
 
 /// (dataset, scope-label) -> discovered ontology, memoized for the process lifetime.
@@ -132,10 +144,17 @@ pub async fn neo4j_graph_schema(
             .await
             .ok_or("ontology discovery failed")?;
 
+            // Best-effort — property discovery must never break the (more valuable)
+            // labels/relationships/ontology above. A `None` just yields no properties.
+            let node_properties = label_properties(&rt, &dataset, &scope)
+                .await
+                .unwrap_or_default();
+
             Ok::<_, &'static str>(Arc::new(GraphSchema {
                 node_labels,
                 relationship_types,
                 ontology,
+                node_properties,
             }))
         })
         .await
@@ -241,6 +260,59 @@ async fn triples(
     out.sort_by(|a, b| (&a.subject, &a.rel, &a.object).cmp(&(&b.subject, &b.rel, &b.object)));
     out.dedup_by(|a, b| a.subject == b.subject && a.rel == b.rel && a.object == b.object);
     Some(out)
+}
+
+/// Discover the property keys present on nodes, grouped by label. Runs the scoped
+/// `MATCH (n) UNWIND labels(n) … UNWIND keys(n) …` — same full-scan cost profile as
+/// node-label discovery, and equally one-shot/cached. A key seen on a multi-label
+/// node (`:Entity:patient`) is attributed to each of its labels; that is intended —
+/// it tells the model which properties are readable on a node bearing that label.
+async fn label_properties(
+    rt: &Arc<Runtime>,
+    dataset: &str,
+    scope: &str,
+) -> Option<Vec<LabelProperties>> {
+    let batches = run_graph_query(
+        rt,
+        dataset,
+        "MATCH (n) UNWIND labels(n) AS s UNWIND keys(n) AS o RETURN DISTINCT s AS s, o AS o",
+        "s, o",
+    )
+    .await?;
+
+    let mut by_label: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for b in &batches {
+        if b.num_columns() < 2 {
+            continue;
+        }
+        let (Some(s), Some(o)) = (str_col(b, 0), str_col(b, 1)) else {
+            continue;
+        };
+        for i in 0..b.num_rows() {
+            if s.is_null(i) || o.is_null(i) {
+                continue;
+            }
+            let label = s.value(i);
+            // The per-tenant scope label is on every node — pure noise here.
+            if !scope.is_empty() && label == scope {
+                continue;
+            }
+            by_label
+                .entry(label.to_string())
+                .or_default()
+                .insert(o.value(i).to_string());
+        }
+    }
+
+    Some(
+        by_label
+            .into_iter()
+            .map(|(label, props)| LabelProperties {
+                label,
+                properties: props.into_iter().collect(),
+            })
+            .collect(),
+    )
 }
 
 #[cfg(test)]
