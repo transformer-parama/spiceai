@@ -150,9 +150,19 @@ pub async fn get_table_elements(
             }
         }
         out.push(ListDatasetElement {
-            table: TableReference::parse_str(&d.name)
-                .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
-                .to_string(),
+            // Emit a QUOTED fully-qualified name (quotes only the parts that need
+            // them). A client pastes this straight into `table_schema` / `sql`, so
+            // it must round-trip through `TableReference::parse_str`. An unquoted
+            // part that starts with a digit (e.g. an Iceberg namespace that is a
+            // bare hex assistant id) does NOT round-trip — parse_str fails to split
+            // it and collapses the whole string into one bare name under `public`,
+            // so `table_schema` reports "table not registered". `to_quoted_string`
+            // produces `lake."94deff…".tbl`, which parses back correctly.
+            table: TableReference::from(
+                TableReference::parse_str(&d.name)
+                    .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA),
+            )
+            .to_quoted_string(),
             can_search_documents: d.has_embeddings(),
             description: d.description.clone(),
             metadata,
@@ -190,7 +200,11 @@ pub async fn get_catalog_elements(
                         })
                         .filter(|d| opt_include.is_none_or(|ts| ts.table_is_allowed(d)))
                         .map(|table| ListDatasetElement {
-                            table: table.to_string(),
+                            // Quoted FQN so the name round-trips through
+                            // parse_str in `table_schema`/`sql` — Iceberg
+                            // namespaces are bare hex ids that start with a digit
+                            // and otherwise fail to parse. See get_table_elements.
+                            table: table.to_quoted_string(),
                             can_search_documents: false,
                             description: None,
                             metadata: HashMap::new(),
@@ -216,9 +230,13 @@ pub async fn get_view_elements(
             opt_include.is_none_or(|ts| ts.table_is_allowed(&TableReference::parse_str(&v.name)))
         })
         .map(|v| ListDatasetElement {
-            table: TableReference::parse_str(&v.name)
-                .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
-                .to_string(),
+            // Quoted FQN so the name round-trips through parse_str downstream.
+            // See get_table_elements.
+            table: TableReference::from(
+                TableReference::parse_str(&v.name)
+                    .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA),
+            )
+            .to_quoted_string(),
             can_search_documents: false,
             description: v.description.clone(),
             metadata: v.metadata.clone(),
