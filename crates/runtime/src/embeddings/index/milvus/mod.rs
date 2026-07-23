@@ -28,7 +28,7 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::sql::TableReference;
 use llms::embeddings::get_or_infer_size;
 use milvus_client::{ConnectionConfig, MilvusCollection, MilvusConnection, arrow_type_for};
-use search::index::milvus::MilvusVector;
+use search::index::milvus::{MilvusTextIndex, MilvusVector};
 use spicepod::{param::Params, semantic::ColumnLevelEmbeddingConfig, vector::VectorStore};
 use tokio::sync::RwLock;
 
@@ -44,6 +44,11 @@ pub(crate) const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("collection").description("Milvus collection name (required)."),
     ParameterSpec::component("vector_field")
         .description("Vector field name (introspected from the collection if unset)."),
+    ParameterSpec::component("sparse_field")
+        .description(
+            "Sparse (BM25) vector field for full-text `text_search`. Auto-discovered from \
+             the collection's BM25 function on the embedded text column if unset.",
+        ),
     ParameterSpec::component("metric").description("Distance metric: COSINE | L2 | IP."),
     ParameterSpec::component("partition")
         .description("Optional Milvus partition to scope searches to (per-tenant isolation)."),
@@ -75,6 +80,62 @@ pub(crate) const PARAMETERS: &[ParameterSpec] = &[
 
 fn string_from_params<'a>(p: &'a Parameters, key: &str) -> Option<&'a str> {
     p.get(key).expose().ok()
+}
+
+/// Build the Milvus [`ConnectionConfig`] shared by the vector and full-text
+/// index paths from the resolved store parameters.
+fn connection_config_from_params(params: &Parameters) -> ConnectionConfig {
+    let port: u16 = string_from_params(params, "port")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(19530);
+    let token = string_from_params(params, "token")
+        .map(str::to_string)
+        .or_else(|| {
+            match (
+                string_from_params(params, "username"),
+                string_from_params(params, "password"),
+            ) {
+                (Some(u), Some(pw)) => Some(format!("{u}:{pw}")),
+                _ => None,
+            }
+        });
+    let bool_flag = |key: &str| -> bool {
+        string_from_params(params, key)
+            .map(|v| matches!(v, "true" | "1" | "yes"))
+            .unwrap_or(false)
+    };
+    let u64_or = |key: &str, default: u64| -> u64 {
+        string_from_params(params, key)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(default)
+    };
+    ConnectionConfig {
+        host: string_from_params(params, "host")
+            .unwrap_or("localhost")
+            .to_string(),
+        port,
+        secure: bool_flag("secure"),
+        token,
+        timeout: Duration::from_millis(u64_or("timeout_ms", 10_000)),
+        connect_timeout: Duration::from_millis(u64_or("connect_timeout_ms", 3_000)),
+        max_retries: u64_or("max_retries", 2) as u32,
+        tls_skip_verify: bool_flag("tls_skip_verify"),
+        tls_ca_cert_path: string_from_params(params, "tls_ca_cert").map(str::to_string),
+    }
+}
+
+/// Whether per-tenant partition scoping is required (per-index param or the
+/// process-wide `SPICE_MILVUS_REQUIRE_PARTITION` env). When required but the
+/// partition is empty, both the vector and full-text index paths fail closed to
+/// avoid serving an unscoped (whole-collection) search across tenants.
+fn require_partition_enabled(params: &Parameters) -> bool {
+    let flag = string_from_params(params, "require_partition")
+        .map(|v| matches!(v, "true" | "1" | "yes"))
+        .unwrap_or(false);
+    flag || matches!(
+        std::env::var("SPICE_MILVUS_REQUIRE_PARTITION").ok().as_deref(),
+        Some("true" | "1" | "yes")
+    )
 }
 
 async fn get_store_params(
@@ -143,43 +204,7 @@ pub async fn try_from_table(
     let params = get_store_params(vector_store_config, Arc::clone(&secrets)).await?;
 
     // Connection.
-    let port: u16 = string_from_params(&params, "port")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(19530);
-    let token = string_from_params(&params, "token")
-        .map(str::to_string)
-        .or_else(|| {
-            match (
-                string_from_params(&params, "username"),
-                string_from_params(&params, "password"),
-            ) {
-                (Some(u), Some(pw)) => Some(format!("{u}:{pw}")),
-                _ => None,
-            }
-        });
-    let bool_flag = |key: &str| -> bool {
-        string_from_params(&params, key)
-            .map(|v| matches!(v, "true" | "1" | "yes"))
-            .unwrap_or(false)
-    };
-    let u64_or = |key: &str, default: u64| -> u64 {
-        string_from_params(&params, key)
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(default)
-    };
-    let cfg = ConnectionConfig {
-        host: string_from_params(&params, "host")
-            .unwrap_or("localhost")
-            .to_string(),
-        port,
-        secure: bool_flag("secure"),
-        token,
-        timeout: Duration::from_millis(u64_or("timeout_ms", 10_000)),
-        connect_timeout: Duration::from_millis(u64_or("connect_timeout_ms", 3_000)),
-        max_retries: u64_or("max_retries", 2) as u32,
-        tls_skip_verify: bool_flag("tls_skip_verify"),
-        tls_ca_cert_path: string_from_params(&params, "tls_ca_cert").map(str::to_string),
-    };
+    let cfg = connection_config_from_params(&params);
     let conn = Arc::new(MilvusConnection::new(cfg).map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(e.to_string()))?);
 
     // Collection + vector field (introspected if not given).
@@ -217,11 +242,7 @@ pub async fn try_from_table(
     // SPICE_MILVUS_REQUIRE_PARTITION env) but unset, refuse to build the index — this
     // is the ONLY tenant boundary on the vector_search path (there is no scalar-filter
     // fallback), so an unscoped search would leak every tenant's vectors.
-    let require_partition = bool_flag("require_partition")
-        || matches!(
-            std::env::var("SPICE_MILVUS_REQUIRE_PARTITION").ok().as_deref(),
-            Some("true" | "1" | "yes")
-        );
+    let require_partition = require_partition_enabled(&params);
     if require_partition && partition.as_deref().unwrap_or("").is_empty() {
         return Err(Box::<dyn std::error::Error + Send + Sync>::from(format!(
             "Milvus vector index for table '{ds_name}' requires `milvus_partition` \
@@ -285,4 +306,120 @@ pub async fn try_from_table(
         model,
         i64::from(dimension),
     ))
+}
+
+/// Build a [`MilvusTextIndex`] (BM25 full-text search) for `column` of dataset
+/// `ds_name`, enabling the keyword half of hybrid search directly on Milvus.
+///
+/// Returns `Ok(None)` when the collection has no BM25 full-text function on the
+/// embedded text column (and no explicit `sparse_field` override) — the dataset
+/// simply stays vector-only. The sparse (BM25 output) field is auto-discovered
+/// from the collection's function definitions, so a BM25-ready collection needs
+/// zero extra configuration.
+pub async fn try_text_index_from_table(
+    ds_name: &TableReference,
+    column: String,
+    config: ColumnLevelEmbeddingConfig,
+    vector_store_config: &VectorStore,
+    primary_keys: Vec<String>,
+    inner_schema: SchemaRef,
+    secrets: Arc<RwLock<Secrets>>,
+) -> Result<Option<MilvusTextIndex>, BoxError> {
+    // Primary key: spicepod `row_ids` override, else the base table's primary key.
+    // Required to fuse text-search hits back with vector-search hits (join key).
+    let primary_key: Vec<Field> = config
+        .row_ids
+        .clone()
+        .unwrap_or(primary_keys)
+        .into_iter()
+        .filter_map(|c| {
+            inner_schema
+                .column_with_name(c.as_str())
+                .map(|(_, f)| f.clone())
+        })
+        .collect();
+    if primary_key.is_empty() {
+        // No join key — cannot fuse; skip the text index (vector-only).
+        tracing::debug!(
+            "Milvus full-text index for '{ds_name}' column '{column}' skipped: no primary key."
+        );
+        return Ok(None);
+    }
+
+    let params = get_store_params(vector_store_config, Arc::clone(&secrets)).await?;
+    let cfg = connection_config_from_params(&params);
+    let conn = Arc::new(
+        MilvusConnection::new(cfg)
+            .map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(e.to_string()))?,
+    );
+
+    let collection = string_from_params(&params, "collection")
+        .ok_or_else(|| {
+            Box::<dyn std::error::Error + Send + Sync>::from(format!(
+                "Milvus full-text index for table '{ds_name}' requires `milvus_collection`."
+            ))
+        })?
+        .to_string();
+
+    let info = conn
+        .describe_collection_info(&collection)
+        .await
+        .map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(e.to_string()))?;
+
+    // Sparse (BM25 output) field: explicit override, else auto-discovered from
+    // the collection's BM25 function whose input is the embedded text column.
+    let sparse_field = string_from_params(&params, "sparse_field")
+        .map(str::to_string)
+        .or_else(|| info.bm25_sparse_field_for(&column));
+    let Some(sparse_field) = sparse_field else {
+        tracing::info!(
+            "Milvus dataset '{ds_name}' has no BM25 full-text function on column '{column}'; \
+             text_search/hybrid is unavailable for it (vector_search still works). Add a BM25 \
+             function + sparse field to the collection, or set `milvus_sparse_field`, to enable it."
+        );
+        return Ok(None);
+    };
+
+    // Optional per-tenant partition + fail-closed check (mirrors the vector path;
+    // the same tenant boundary must apply to full-text search).
+    let partition = string_from_params(&params, "partition").map(str::to_string);
+    if require_partition_enabled(&params) && partition.as_deref().unwrap_or("").is_empty() {
+        return Err(Box::<dyn std::error::Error + Send + Sync>::from(format!(
+            "Milvus full-text index for table '{ds_name}' requires `milvus_partition` \
+             (require_partition / SPICE_MILVUS_REQUIRE_PARTITION set) but it is empty — \
+             refusing to serve an unscoped (whole-collection) text_search"
+        )));
+    }
+
+    // Milvus-only mode (base IS the Milvus connector, detected by `query_vector`):
+    // return every scalar field so the fused result carries the row data; else
+    // return just the primary key and let the search layer join back.
+    let milvus_only = inner_schema.column_with_name("query_vector").is_some();
+    let data_fields: Vec<Field> = if milvus_only {
+        info.fields
+            .iter()
+            .filter(|f| !f.is_vector)
+            .map(|f| Field::new(&f.name, arrow_type_for(&f.type_name), true))
+            .collect()
+    } else {
+        primary_key.clone()
+    };
+    let output_fields: Vec<String> = data_fields.iter().map(|f| f.name().clone()).collect();
+
+    let coll = MilvusCollection {
+        collection,
+        vector_field: sparse_field, // annsField for the BM25 sparse search
+        metric: "BM25".to_string(),
+        output_fields,
+        partition,
+    };
+
+    let mut schema_fields: Vec<Field> = data_fields;
+    schema_fields.push(Field::new("score", DataType::Float32, false));
+    let schema: SchemaRef = Arc::new(Schema::new(schema_fields));
+
+    // Dimension is unused for sparse BM25 search; pass 0.
+    let table = data_components::milvus::MilvusVectorsTable::new(conn, coll, schema, 0);
+
+    Ok(Some(MilvusTextIndex::new(table, column, primary_key)))
 }

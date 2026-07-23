@@ -43,6 +43,8 @@ use datafusion_expr::{ScalarFunctionArgs, ScalarUDFImpl};
 use moka::future::FutureExt;
 #[cfg(feature = "elasticsearch")]
 use search::index::elasticsearch::ElasticsearchTextIndex;
+#[cfg(feature = "milvus_vectors")]
+use search::index::milvus::MilvusTextIndex;
 use search::{
     generation::text_search::index::FullTextDatabaseIndex,
     index::SearchIndex,
@@ -290,6 +292,74 @@ impl TextSearchTableFunc {
             })),
         ))
     }
+
+    /// Dispatch `text_search()` against Milvus-native BM25 full-text indexes.
+    /// Mirrors the Elasticsearch path: pick the index for the requested column
+    /// (or the sole index) and wrap it in a [`SearchQueryProvider`]. This is the
+    /// keyword half of `rrf(vector_search, text_search)` hybrid search on Milvus.
+    #[cfg(feature = "milvus_vectors")]
+    fn call_with_milvus_text_indexes(
+        mv_indexes: &[&MilvusTextIndex],
+        args: &TextSearchTableFuncArgs,
+        table_provider: Arc<dyn datafusion::catalog::TableProvider>,
+    ) -> DataFusionResult<Arc<dyn datafusion::catalog::TableProvider>> {
+        let mv_index: &MilvusTextIndex = if let Some(ref requested) = args.column {
+            mv_indexes
+                .iter()
+                .copied()
+                .find(|idx| idx.search_column() == *requested)
+                .ok_or_else(|| {
+                    let all: Vec<String> =
+                        mv_indexes.iter().map(|idx| idx.search_column()).collect();
+                    DataFusionError::Plan(format!(
+                        "User function 'text_search' is called on table '{}' that does not have a full text search index on '{}' column. Indexed column(s): {}.{}",
+                        args.tbl,
+                        requested,
+                        all.join(", "),
+                        suggest_column(requested, &all)
+                            .map(|s| format!(" Did you mean '{s}'?"))
+                            .unwrap_or_default()
+                    ))
+                })?
+        } else if mv_indexes.len() == 1 {
+            mv_indexes[0]
+        } else {
+            let all: Vec<String> = mv_indexes.iter().map(|idx| idx.search_column()).collect();
+            return Err(DataFusionError::Plan(format!(
+                "User function 'text_search' is called on table '{}' that has {} full text search column(s) ({}). Must call 'text_search' with a column parameter, e.g. `text_search(\"my table\", 'my query', my_search_col)`",
+                args.tbl,
+                all.len(),
+                all.join(", "),
+            )));
+        };
+
+        let column = mv_index.search_column();
+        let udtf_source = UdtfSource::TextSearch {
+            table: args.tbl.to_string(),
+            query: args.query.clone(),
+            column: Some(column),
+            limit: args.limit,
+            include_score: args.include_score,
+        };
+
+        Ok(Arc::new(
+            SearchQueryProvider::try_from_index(
+                &(Arc::new(mv_index.clone()) as Arc<dyn SearchIndex>),
+                table_provider,
+                args.query.as_str(),
+                args.limit,
+            )?
+            .with_udtf_source(udtf_source)
+            .with_include_score(args.include_score.unwrap_or(true))
+            .call_on_scan(Arc::new(|| {
+                async {
+                    let request_context = RequestContext::current(AsyncMarker::new().await);
+                    telemetry::track_text_search(&request_context.to_dimensions());
+                }
+                .boxed()
+            })),
+        ))
+    }
 }
 
 impl TextSearchTableFunc {
@@ -502,6 +572,21 @@ impl TableFunctionImpl for TextSearchTableFunc {
             && !es_indexes.is_empty()
         {
             return Self::call_with_es_indexes(&es_indexes, &args, Arc::clone(&table_provider));
+        }
+
+        // Phase 3: try Milvus-native BM25 full-text indexes (enables hybrid search
+        // on Milvus). Only when no Tantivy index matched this table.
+        #[cfg(feature = "milvus_vectors")]
+        if fts_indexes.is_none()
+            && let Some((mv_indexes, _)) =
+                find_index_in_table_provider::<MilvusTextIndex>(&table_provider)
+            && !mv_indexes.is_empty()
+        {
+            return Self::call_with_milvus_text_indexes(
+                &mv_indexes,
+                &args,
+                Arc::clone(&table_provider),
+            );
         }
 
         let fts_indexes = fts_indexes

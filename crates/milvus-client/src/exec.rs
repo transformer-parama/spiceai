@@ -111,7 +111,7 @@ impl MilvusExec {
     /// Build one Arrow column for `field` from the JSON hit rows, dispatching on
     /// the field's Arrow type. `query_vector` is input-only (always null);
     /// `score` comes from the (normalized) similarity.
-    fn build_column(field: &Field, hits: &[Hit]) -> ArrayRef {
+    pub(crate) fn build_column(field: &Field, hits: &[Hit]) -> ArrayRef {
         let name = field.name().as_str();
         if name == "query_vector" {
             let mut b = StringBuilder::new();
@@ -178,7 +178,7 @@ impl MilvusExec {
         }
     }
 
-    fn build_batch(
+    pub(crate) fn build_batch(
         full_schema: &SchemaRef,
         projection: &Option<Vec<usize>>,
         hits: &[Hit],
@@ -252,6 +252,129 @@ impl ExecutionPlan for MilvusExec {
                 .map_err(|e| DataFusionError::External(Box::new(e)))?;
             tracing::debug!(target: "connector_milvus", hits = hits.len(), "milvus search ok");
             Self::build_batch(&full_schema, &projection, &hits)
+        };
+
+        let stream = futures::stream::once(fut);
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            self.projected_schema.clone(),
+            stream,
+        )))
+    }
+}
+
+/// `ExecutionPlan` that turns one Milvus BM25 full-text search into an Arrow
+/// RecordBatch. Mirrors [`MilvusExec`] but sends the query TEXT (not a vector)
+/// to Milvus's sparse BM25 search — the counterpart used by `text_search`.
+#[derive(Debug)]
+pub struct MilvusTextExec {
+    conn: Arc<MilvusConnection>,
+    coll: MilvusCollection,
+    query: String,
+    filter: Option<String>,
+    limit: usize,
+    full_schema: SchemaRef,
+    projected_schema: SchemaRef,
+    projection: Option<Vec<usize>>,
+    props: PlanProperties,
+}
+
+impl MilvusTextExec {
+    pub fn new(
+        conn: Arc<MilvusConnection>,
+        mut coll: MilvusCollection,
+        full_schema: SchemaRef,
+        query: String,
+        filter: Option<String>,
+        limit: usize,
+        projection: Option<Vec<usize>>,
+    ) -> Result<Self> {
+        let projected_schema = match &projection {
+            Some(idx) => Arc::new(full_schema.project(idx).map_err(DataFusionError::from)?),
+            None => full_schema.clone(),
+        };
+        // projection pushdown: ask Milvus only for the scalar fields this scan
+        // returns (score is synthetic; there is no query_vector input column).
+        coll.output_fields = projected_schema
+            .fields()
+            .iter()
+            .map(|f| f.name().to_string())
+            .filter(|n| n != "score")
+            .collect();
+        let props = PlanProperties::new(
+            EquivalenceProperties::new(projected_schema.clone()),
+            Partitioning::UnknownPartitioning(1),
+            EmissionType::Incremental,
+            Boundedness::Bounded,
+        );
+        Ok(Self {
+            conn,
+            coll,
+            query,
+            filter,
+            limit,
+            full_schema,
+            projected_schema,
+            projection,
+            props,
+        })
+    }
+}
+
+impl DisplayAs for MilvusTextExec {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(
+            f,
+            "MilvusTextExec: collection={}, sparse_field={}, limit={}, filter={:?}",
+            self.coll.collection, self.coll.vector_field, self.limit, self.filter
+        )
+    }
+}
+
+impl ExecutionPlan for MilvusTextExec {
+    fn name(&self) -> &str {
+        "MilvusTextExec"
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn properties(&self) -> &PlanProperties {
+        &self.props
+    }
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![]
+    }
+    fn with_new_children(
+        self: Arc<Self>,
+        _children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        Ok(self)
+    }
+
+    fn execute(
+        &self,
+        _partition: usize,
+        _ctx: Arc<TaskContext>,
+    ) -> Result<SendableRecordBatchStream> {
+        let conn = Arc::clone(&self.conn);
+        let coll = self.coll.clone();
+        let query = self.query.clone();
+        let filter = self.filter.clone();
+        let limit = self.limit;
+        let full_schema = self.full_schema.clone();
+        let projection = self.projection.clone();
+
+        let fut = async move {
+            let span = tracing::debug_span!(
+                target: "connector_milvus", "milvus_text_search",
+                collection = %coll.collection, limit
+            );
+            let _enter = span.enter();
+            let hits = conn
+                .text_search(&coll, &query, limit, filter)
+                .await
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+            tracing::debug!(target: "connector_milvus", hits = hits.len(), "milvus text_search ok");
+            MilvusExec::build_batch(&full_schema, &projection, &hits)
         };
 
         let stream = futures::stream::once(fut);

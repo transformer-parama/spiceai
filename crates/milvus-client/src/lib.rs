@@ -25,7 +25,8 @@ limitations under the License.
 mod exec;
 mod milvus;
 
-pub use exec::{MilvusExec, arrow_type_for};
+pub use exec::{MilvusExec, MilvusTextExec, arrow_type_for};
 pub use milvus::{
-    CollectionField, ConnectionConfig, Hit, MilvusCollection, MilvusConnection, MilvusError,
+    CollectionField, CollectionFunction, CollectionInfo, ConnectionConfig, Hit, MilvusCollection,
+    MilvusConnection, MilvusError,
 };

@@ -46,6 +46,9 @@ use crate::index::milvus::compute_query::EmbedQuery;
 use crate::index::{SearchIndex, VectorIndex};
 
 mod compute_query;
+mod text;
+
+pub use text::MilvusTextIndex;
 
 /// The Milvus exec produces a similarity column named `score`; the search layer
 /// expects [`SEARCH_SCORE_COLUMN_NAME`]. We alias it in `query_table_provider`.

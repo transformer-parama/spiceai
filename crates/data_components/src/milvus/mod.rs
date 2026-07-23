@@ -20,9 +20,11 @@ limitations under the License.
 
 mod compute_query;
 mod query_provider;
+mod text_query_provider;
 
 pub use compute_query::{CachedQueryVector, ComputeQueryVector};
 pub use query_provider::MilvusQueryTable;
+pub use text_query_provider::MilvusTextSearchTable;
 
 use std::sync::Arc;
 

@@ -249,8 +249,8 @@ async fn wrap_table_as_index_milvus(
     for (column, config) in embedding_columns {
         let vector_index = super::milvus::try_from_table(
             tbl,
-            column,
-            config,
+            column.clone(),
+            config.clone(),
             vector_store,
             // Primary key: spicepod override, fallback to the base table's PK.
             get_primary_keys(&inner_table_provider).boxed()?,
@@ -260,6 +260,26 @@ async fn wrap_table_as_index_milvus(
         )
         .await?;
         provider = provider.add_index(Arc::new(vector_index) as Arc<dyn Index>);
+
+        // Also attach a BM25 full-text index when the Milvus collection is
+        // full-text ready (has a BM25 function on this text column). This is what
+        // makes `text_search` — and therefore `rrf(vector_search, text_search)`
+        // hybrid search — work directly on Milvus. Absent a BM25 function, this
+        // is a no-op and the dataset stays vector-only.
+        if let Some(text_index) = super::milvus::try_text_index_from_table(
+            tbl,
+            column,
+            config,
+            vector_store,
+            get_primary_keys(&inner_table_provider).boxed()?,
+            Arc::clone(&inner_schema),
+            Arc::clone(secrets),
+        )
+        .await?
+        {
+            tracing::info!("Milvus full-text (BM25) search enabled for table {tbl}.");
+            provider = provider.add_index(Arc::new(text_index) as Arc<dyn Index>);
+        }
     }
 
     tracing::info!(
