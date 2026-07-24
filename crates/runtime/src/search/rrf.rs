@@ -88,8 +88,29 @@ pub static DOCUMENTATION: LazyLock<Documentation> = LazyLock::new(|| {
 }
 });
 
-pub static SIGNATURE: LazyLock<Signature> =
-    LazyLock::new(|| Signature::variadic_any(Volatility::Stable));
+pub static SIGNATURE: LazyLock<Signature> = LazyLock::new(|| {
+    // Declare rrf's named parameters so `name => value` args (notably `join_key =>`)
+    // are accepted even when rrf is NESTED inside another UDTF such as
+    // `rerank(rrf(...), ...)`. Without declared parameter names, DataFusion rejects
+    // nested named args with "Function 'rrf' does not support named arguments" — the
+    // top-level table-function path tolerated them, but the nested scalar-function
+    // path validated against this signature and found none. Mirrors the
+    // `text_search` / `vector_search` signatures.
+    let param_names = vec![
+        "k".to_string(),
+        "limit".to_string(),
+        "join_key".to_string(),
+        "time_column".to_string(),
+        "recency_decay".to_string(),
+        "decay_constant".to_string(),
+        "decay_scale_secs".to_string(),
+        "decay_window_secs".to_string(),
+        "rank_weight".to_string(),
+    ];
+    Signature::user_defined(Volatility::Stable)
+        .with_parameter_names(param_names)
+        .unwrap_or_else(|_| Signature::variadic_any(Volatility::Stable))
+});
 
 macro_rules! extract_scalar_base {
     ($map:expr, $key:literal, $datatype:expr, $pattern:pat => $value:expr) => {
@@ -1123,6 +1144,12 @@ impl ScalarUDFImpl for ReciprocalRankFusion {
 
     fn invoke_with_args(&self, _args: ScalarFunctionArgs) -> Result<ColumnarValue> {
         Self::scalar_stub_error()
+    }
+
+    /// Required for the `UserDefined` signature — accept any arg types (rrf's
+    /// positional args are nested search UDTF calls; the rest are named args).
+    fn coerce_types(&self, arg_types: &[DataType]) -> Result<Vec<DataType>> {
+        Ok(arg_types.to_vec())
     }
 
     fn documentation(&self) -> Option<&Documentation> {
