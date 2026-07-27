@@ -89,14 +89,34 @@ pub static DOCUMENTATION: LazyLock<Documentation> = LazyLock::new(|| {
 });
 
 pub static SIGNATURE: LazyLock<Signature> = LazyLock::new(|| {
-    // Declare rrf's named parameters so `name => value` args (notably `join_key =>`)
-    // are accepted even when rrf is NESTED inside another UDTF such as
-    // `rerank(rrf(...), ...)`. Without declared parameter names, DataFusion rejects
-    // nested named args with "Function 'rrf' does not support named arguments" — the
-    // top-level table-function path tolerated them, but the nested scalar-function
-    // path validated against this signature and found none. Mirrors the
-    // `text_search` / `vector_search` signatures.
+    // Declare rrf's named parameters so `name => value` args (notably `join_key =>`,
+    // `limit =>`, `k =>`) are accepted even when rrf is NESTED inside another UDTF
+    // such as `rerank(rrf(...), ...)`. Without declared parameter names, DataFusion
+    // rejects nested named args with "Function 'rrf' does not support named
+    // arguments". Mirrors the `text_search` / `vector_search` signatures.
+    //
+    // rrf is VARIADIC in its POSITIONAL arguments (the nested search UDTF calls it
+    // fuses — at least 2, occasionally more). DataFusion's named-argument reorderer
+    // (datafusion/expr/src/arguments.rs) places positional args into result slots
+    // 0..N by position and named args into their parameter's index. So any named
+    // parameter whose index is < the number of positional searches collides with a
+    // search — that is exactly why `k`(idx 0)/`limit`(idx 1) failed while
+    // `join_key`(idx 2) worked with two searches ("Parameter 'limit' specified
+    // multiple times"). Reserve leading placeholder slots for the positional search
+    // lists so every REAL named parameter sits safely past them. Eight placeholders
+    // cover any realistic fan-in (2–4 lists is typical); they are never used as
+    // `name => value`.
     let param_names = vec![
+        // placeholders reserving the variadic positional search-list slots
+        "q1".to_string(),
+        "q2".to_string(),
+        "q3".to_string(),
+        "q4".to_string(),
+        "q5".to_string(),
+        "q6".to_string(),
+        "q7".to_string(),
+        "q8".to_string(),
+        // real named parameters, now safely past any positional argument
         "k".to_string(),
         "limit".to_string(),
         "join_key".to_string(),
